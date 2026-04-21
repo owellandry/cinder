@@ -8,6 +8,8 @@
 #include "installer.h"
 #include "lockfile.h"
 
+#include "dev/devserver.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,9 +19,15 @@
 #  include <windows.h>
 #  include <direct.h>
 #  define PM_GETCWD(buf, size) GetCurrentDirectoryA((DWORD)(size), (buf))
+#  define PATH_SEP  ";"
+#  define DIR_SEP   "\\"
 #else
 #  include <unistd.h>
+#  include <sys/wait.h>
+#  include <sys/stat.h>
 #  define PM_GETCWD(buf, size) getcwd((buf), (size))
+#  define PATH_SEP  ":"
+#  define DIR_SEP   "/"
 #endif
 
 #include "cJSON.h"
@@ -447,8 +455,44 @@ static int spawn_wait(const char *cmdline) {
     return (int)code;
 }
 #else
+static int has_shell_meta(const char *s) {
+    return strpbrk(s, "|&;()$`\\\"'*?[#~=!{}<>") != NULL;
+}
+
 static int spawn_wait(const char *cmdline) {
-    return system(cmdline);
+    if (has_shell_meta(cmdline))
+        return system(cmdline);
+
+    /* Tokenize into argv (simple space split — no quoting) */
+    char buf[4096];
+    strncpy(buf, cmdline, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    char *toks[128];
+    int n = 0;
+    char *p = strtok(buf, " \t");
+    while (p && n < 127) { toks[n++] = p; p = strtok(NULL, " \t"); }
+    toks[n] = NULL;
+    if (n == 0) return 0;
+
+    /* Resolve binary in node_modules/.bin if not absolute */
+    char resolved[2048];
+    if (toks[0][0] != '/') {
+        snprintf(resolved, sizeof(resolved), "node_modules/.bin/%s", toks[0]);
+        struct stat st;
+        if (stat(resolved, &st) == 0 && (st.st_mode & S_IXUSR))
+            toks[0] = resolved;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) return system(cmdline);
+    if (pid == 0) {
+        execvp(toks[0], toks);
+        _exit(127);
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
 }
 #endif
 
@@ -477,14 +521,53 @@ int pm_run_script(const char *script_name, int argc, char *argv[]) {
         return 1;
     }
 
-    const char *cmd = script->valuestring;
+    /* Copy command string before freeing the JSON tree */
+    char cmd_buf[4096];
+    strncpy(cmd_buf, script->valuestring, sizeof(cmd_buf) - 1);
+    cmd_buf[sizeof(cmd_buf) - 1] = '\0';
+    const char *cmd = cmd_buf;
+    cJSON_Delete(root);
 
-    /* Prepend node_modules\.bin to PATH so local binaries (vite, tsc, etc.) resolve */
+    /* ── Fast-path: intercept known dev-server commands ────────────── */
+    {
+        const char *p = cmd;
+        /* skip optional leading "npx " */
+        if (strncmp(p, "npx ", 4) == 0) p += 4;
+
+        int is_vite = (strncmp(p, "vite", 4) == 0 &&
+                       (p[4] == '\0' || p[4] == ' '));
+
+        if (is_vite) {
+            /* Check for --no-native opt-out */
+            int native_disabled = (getenv("CINDER_NO_NATIVE") != NULL)
+                               || (strstr(cmd, "--no-native") != NULL);
+            if (!native_disabled) {
+                DevServerConfig cfg;
+                if (devserver_discover(&cfg, ".") == 0 && cfg.esbuild_bin) {
+                    /* Parse --port from the original command */
+                    const char *port_flag = strstr(cmd, "--port");
+                    if (port_flag) {
+                        port_flag += 6;
+                        while (*port_flag == ' ' || *port_flag == '=') port_flag++;
+                        int pv = atoi(port_flag);
+                        if (pv > 0) cfg.port = pv;
+                    }
+                    printf("  \033[36m⚡ cinder native dev server\033[0m  "
+                           "(bypassing vite for ~10x faster startup)\n");
+                    return devserver_run(&cfg);
+                }
+            }
+        }
+    }
+
+    /* ── Normal path: spawn the script command ────────────────────── */
     const char *old_path = getenv("PATH");
     if (old_path) {
         char new_path[8192];
         snprintf(new_path, sizeof(new_path),
-                 "node_modules\\.bin;.\\node_modules\\.bin;%s", old_path);
+                 "node_modules" DIR_SEP ".bin" PATH_SEP
+                 "." DIR_SEP "node_modules" DIR_SEP ".bin" PATH_SEP
+                 "%s", old_path);
 #ifdef _WIN32
         SetEnvironmentVariableA("PATH", new_path);
 #else
@@ -511,7 +594,6 @@ int pm_run_script(const char *script_name, int argc, char *argv[]) {
     pm_print_elapsed(elapsed);
     printf("]\n");
 
-    cJSON_Delete(root);
     return ret;
 }
 

@@ -15,6 +15,7 @@
 #  define platform_str "win32"
 #else
 #  include <unistd.h>
+#  include <time.h>
 #  if defined(__APPLE__)
 #    define platform_str "darwin"
 #  else

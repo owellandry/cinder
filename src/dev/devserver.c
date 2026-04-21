@@ -37,11 +37,18 @@ typedef SOCKET sock_t;
 #  include <arpa/inet.h>
 #  include <unistd.h>
 #  include <fcntl.h>
+#  include <errno.h>
+#  include <signal.h>
+#  include <sys/wait.h>
 #  include <sys/select.h>
 #  include <sys/stat.h>
 #  include <sys/types.h>
 #  include <dirent.h>
+#  include <pthread.h>
+#  include <sys/inotify.h>
+#  include <poll.h>
 typedef int sock_t;
+typedef pid_t HANDLE;
 #  define SOCK_INVALID  (-1)
 #  define sock_close(s) close(s)
 #  define sock_error()  errno
@@ -571,7 +578,6 @@ static pid_t spawn_background(const char *cmd) {
     if (pid == 0) { execlp("sh", "sh", "-c", cmd, NULL); _exit(127); }
     return pid;
 }
-typedef pid_t HANDLE;
 #endif
 
 /* ── File watcher thread ─────────────────────────────────────────────────────── */
@@ -608,19 +614,42 @@ static DWORD WINAPI watcher_thread(LPVOID arg) {
 #else
 static void *watcher_thread(void *arg) {
     (void)arg;
-    /* Basic polling fallback on non-Windows */
-    time_t last_bundle = 0, last_style = 0;
+    int ifd = inotify_init();
+    if (ifd < 0) {
+        /* inotify unavailable: fall back to polling */
+        time_t last_bundle = 0, last_style = 0;
+        while (g_server_running) {
+            struct stat st;
+            time_t t1 = 0, t2 = 0;
+            if (stat(BUNDLE_FILE, &st) == 0) t1 = st.st_mtime;
+            if (stat(STYLE_FILE, &st) == 0) t2 = st.st_mtime;
+            if ((t1 && t1 != last_bundle) || (t2 && t2 != last_style)) {
+                last_bundle = t1; last_style = t2;
+                ws_broadcast("{\"type\":\"reload\"}");
+            }
+            usleep(100000);
+        }
+        return NULL;
+    }
+
+    inotify_add_watch(ifd, CINDER_DIR, IN_CLOSE_WRITE | IN_MOVED_TO);
+
+    char evt_buf[4096]
+        __attribute__((aligned(__alignof__(struct inotify_event))));
+    struct pollfd pfd = { .fd = ifd, .events = POLLIN };
+
     while (g_server_running) {
-        struct stat st;
-        time_t t1 = 0, t2 = 0;
-        if (stat(BUNDLE_FILE, &st) == 0) t1 = st.st_mtime;
-        if (stat(STYLE_FILE, &st) == 0) t2 = st.st_mtime;
-        if ((t1 && t1 != last_bundle) || (t2 && t2 != last_style)) {
-            last_bundle = t1; last_style = t2;
+        int ret = poll(&pfd, 1, 200);
+        if (ret > 0 && (pfd.revents & POLLIN)) {
+            /* Drain all pending events */
+            while (read(ifd, evt_buf, sizeof(evt_buf)) > 0) {}
+            /* Short debounce for esbuild multi-write */
+            usleep(30000);
+            while (read(ifd, evt_buf, sizeof(evt_buf)) > 0) {}
             ws_broadcast("{\"type\":\"reload\"}");
         }
-        usleep(200000); /* poll every 200ms */
     }
+    close(ifd);
     return NULL;
 }
 #endif
