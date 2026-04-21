@@ -1,6 +1,7 @@
 #include "cli.h"
 #include "runtime/runtime.h"
 #include "pm/pm.h"
+#include "dev/devserver.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -16,7 +17,8 @@ void cli_print_help(void) {
     printf(
         "cinder v" CINDER_VERSION " — JavaScript runtime & package manager\n\n"
         "Usage:\n"
-        "  cinder <file.js>          Run a JavaScript file\n"
+        "  cinder dev                    Start native dev server (replaces Vite)\n"
+        "  cinder <file.js>              Run a JavaScript file\n"
         "  cinder run <script>       Run a script from package.json\n"
         "  cinder init               Create a new package.json\n"
         "  cinder install            Install all dependencies\n"
@@ -50,6 +52,20 @@ int cli_main(int argc, char *argv[]) {
     if (strcmp(cmd, "--help") == 0 || strcmp(cmd, "-h") == 0) {
         cli_print_help();
         return 0;
+    }
+
+    /* ── Dev server ───────────────────────────────────────────────────────── */
+    if (strcmp(cmd, "dev") == 0) {
+        DevServerConfig cfg;
+        const char *root = argc > 2 ? argv[2] : ".";
+        if (devserver_discover(&cfg, root) != 0) return 1;
+        /* Allow --port override */
+        for (int i = 2; i < argc - 1; i++) {
+            if (strcmp(argv[i], "--port") == 0 || strcmp(argv[i], "-p") == 0) {
+                cfg.port = atoi(argv[i + 1]);
+            }
+        }
+        return devserver_run(&cfg);
     }
 
     /* ── Package manager commands ─────────────────────────────────────── */

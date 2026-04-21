@@ -64,6 +64,7 @@ set(CINDER_SOURCES
     src/pm/resolver.c
     src/pm/installer.c
     src/pm/lockfile.c
+    src/dev/devserver.c
 )
 
 add_executable(cinder ${CINDER_SOURCES})
@@ -71,6 +72,7 @@ add_executable(cinder ${CINDER_SOURCES})
 target_include_directories(cinder PRIVATE
     src
     src/util
+    src/dev
     ${QJS_DIR}
     ${CJSON_DIR}
 )
@@ -83,7 +85,7 @@ target_link_libraries(cinder PRIVATE
 )
 
 if(WIN32)
-    target_link_libraries(cinder PRIVATE ws2_32)
+    target_link_libraries(cinder PRIVATE ws2_32 bcrypt)
 elseif(UNIX)
     target_link_libraries(cinder PRIVATE m pthread dl)
 endif()
