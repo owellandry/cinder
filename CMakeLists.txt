@@ -69,6 +69,8 @@ set(CINDER_SOURCES
 
 add_executable(cinder ${CINDER_SOURCES})
 
+target_compile_definitions(cinder PRIVATE _GNU_SOURCE)
+
 target_include_directories(cinder PRIVATE
     src
     src/util
