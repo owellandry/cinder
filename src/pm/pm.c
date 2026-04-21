@@ -237,12 +237,20 @@ static int plat_word_in_name(const char *name, const char *word) {
 }
 
 /* Returns 1 if the package should be SKIPPED for the current platform.
- * Handles both scoped (@vendor/os-cpu) and non-scoped (pkg-os-cpu) forms. */
+ * Works for both scoped (@vendor/pkg-os-cpu-abi) and non-scoped (pkg-os-cpu) forms.
+ * Strategy: check if any foreign OS or CPU token appears as a word in the name. */
 static int plat_pkg_skip(const char *pkg_name) {
-    static const char *plat_oses[]  = { "darwin", "linux", "freebsd", "android", "win32", NULL };
-    static const char *plat_cpus[]  = { "arm64", "arm", "ia32", "x86", NULL }; /* NOT x64 — too common substring */
+    /* Known platform OS identifiers */
+    static const char *plat_oses[] = {
+        "darwin", "linux", "freebsd", "android", "win32", "wasm32",
+        "netbsd", "openbsd", "aix", "sunos", "openharmony", "wasi", NULL
+    };
+    /* Known CPU identifiers — x64 is included here (safe under has_os guard) */
+    static const char *plat_cpus[] = {
+        "arm64", "arm", "ia32", "x86", "x64", "ppc64", "loong64", "riscv64", "s390x", NULL
+    };
 
-    /* Extract OS and CPU from g_plat_id (e.g. "win32-x64") */
+    /* Extract current OS and CPU from g_plat_id (e.g. "win32-x64") */
     char cur_os[32] = {0}, cur_cpu[32] = {0};
     const char *dash = strchr(g_plat_id, '-');
     if (dash) {
@@ -251,29 +259,23 @@ static int plat_pkg_skip(const char *pkg_name) {
         strncpy(cur_cpu, dash + 1, 31);
     }
 
-    /* For scoped packages: @vendor/os-cpu or @vendor/os-cpu-abi */
-    const char *slash = strchr(pkg_name + (pkg_name[0] == '@' ? 1 : 0), '/');
-    if (slash) {
-        const char *suf = slash + 1;
-        /* Only filter if suffix looks like a platform string (has dash, no dot) */
-        if (strchr(suf, '-') && !strchr(suf, '.')) {
-            /* Allow if suffix starts with current platform id */
-            if (strncmp(suf, g_plat_id, strlen(g_plat_id)) != 0)
-                return 1; /* platform mismatch */
-        }
-        return 0;
-    }
-
-    /* For non-scoped packages: check for foreign OS identifier as a word */
+    /* Check for foreign OS — applies to all package name forms */
+    int has_os = 0;
     for (int k = 0; plat_oses[k]; k++) {
-        if (strcmp(plat_oses[k], cur_os) == 0) continue; /* current OS — always OK */
-        if (plat_word_in_name(pkg_name, plat_oses[k])) return 1;
+        if (!plat_word_in_name(pkg_name, plat_oses[k])) continue;
+        has_os = 1;
+        if (strcmp(plat_oses[k], cur_os) != 0)
+            return 1; /* foreign OS → skip */
     }
 
-    /* Check for foreign CPU architecture */
-    for (int k = 0; plat_cpus[k]; k++) {
-        if (strcmp(plat_cpus[k], cur_cpu) == 0) continue;
-        if (plat_word_in_name(pkg_name, plat_cpus[k])) return 1;
+    /* Check for foreign CPU (only matters if an OS token was found — avoids
+     * accidentally filtering non-platform packages that contain e.g. "arm" in their name) */
+    if (has_os) {
+        for (int k = 0; plat_cpus[k]; k++) {
+            if (strcmp(plat_cpus[k], cur_cpu) == 0) continue;
+            if (plat_word_in_name(pkg_name, plat_cpus[k]))
+                return 1; /* wrong CPU variant → skip */
+        }
     }
 
     return 0;

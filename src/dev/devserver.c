@@ -6,6 +6,8 @@
  *   2. Optionally spawn tailwindcss --watch → writes .cinder/style.css
  *   3. HTTP server (Winsock2/BSD) serves static files + .cinder artifacts
  *   4. ReadDirectoryChangesW watches .cinder/ for rebuilt artifacts
+ * 
+ * 
  *   5. WebSocket broadcasts {"type":"reload"} to all browser clients
  *
  * Result: server ready in < 5ms, JS rebuilds in 10-50ms.
@@ -57,13 +59,14 @@ typedef pid_t HANDLE;
 
 /* ── Constants ───────────────────────────────────────────────────────────────── */
 
-#define CINDER_DIR     ".cinder"
-#define BUNDLE_FILE    ".cinder/bundle.js"
-#define STYLE_FILE     ".cinder/style.css"
-#define MAX_WS_CLIENTS 64
-#define RECV_BUF_SIZE  8192
-#define WS_GUID        "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-#define TW_CDN         "https://cdn.tailwindcss.com"
+#define CINDER_DIR      ".cinder"
+#define BUNDLE_FILE     ".cinder/bundle.js"
+#define BUNDLE_CSS_FILE ".cinder/bundle.css"
+#define STYLE_FILE      ".cinder/style.css"
+#define TW_WATCHER_JS   ".cinder/tw-watcher.mjs"
+#define MAX_WS_CLIENTS  64
+#define RECV_BUF_SIZE   8192
+#define WS_GUID         "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 static int g_use_tw_cdn = 0; /* inject Tailwind CDN if no local CLI */
 
@@ -75,6 +78,10 @@ static const char *HMR_SCRIPT =
     "  ws.onmessage = function(e){\n"
     "    var m = JSON.parse(e.data);\n"
     "    if(m.type==='reload') location.reload();\n"
+    "    if(m.type==='css-reload'){\n"
+    "      var l=document.querySelector('link[href*=\"@cinder\"]');\n"
+    "      if(l){l.href=l.href.split('?')[0]+'?t='+Date.now();}\n"
+    "    }\n"
     "  };\n"
     "  ws.onerror = function(){\n"
     "    setTimeout(function(){\n"
@@ -85,6 +92,72 @@ static const char *HMR_SCRIPT =
     "  };\n"
     "}());\n"
     "</script>\n";
+
+/* Tailwind v4 watcher script — written to .cinder/tw-watcher.mjs and spawned via node */
+static const char *TW_WATCHER_SCRIPT =
+    "import { compile } from '../node_modules/@tailwindcss/node/dist/index.mjs';\n"
+    "import { Scanner } from '../node_modules/@tailwindcss/oxide/index.js';\n"
+    "import { readFileSync, writeFileSync, mkdirSync, watch } from 'fs';\n"
+    "import { resolve, dirname, join } from 'path';\n"
+    "import { fileURLToPath } from 'url';\n"
+    "\n"
+    "const INPUT  = process.argv[2];\n"
+    "const OUTPUT = process.argv[3];\n"
+    "const BASE   = resolve(fileURLToPath(import.meta.url), '../..');\n"
+    "\n"
+    "mkdirSync(dirname(OUTPUT), { recursive: true });\n"
+    "\n"
+    "let compiler = null;\n"
+    "let timer = null;\n"
+    "\n"
+    "async function fullBuild() {\n"
+    "  try {\n"
+    "    const css  = readFileSync(join(BASE, INPUT), 'utf8');\n"
+    "    const base = dirname(resolve(join(BASE, INPUT)));\n"
+    "    compiler   = await compile(css, {\n"
+    "      base,\n"
+    "      shouldRewriteUrls: false,\n"
+    "      onDependency: () => {},\n"
+    "    });\n"
+    "    const scanner = new Scanner({\n"
+    "      sources: [{ base: join(BASE, 'src'), pattern: '**/*.{tsx,ts,jsx,js,html}', negated: false }]\n"
+    "    });\n"
+    "    const out = compiler.build(scanner.scan());\n"
+    "    writeFileSync(join(BASE, OUTPUT), out, 'utf8');\n"
+    "    process.stdout.write('[tw-done]\\n');\n"
+    "  } catch(e) {\n"
+    "    process.stderr.write('[tw-error] ' + e.message + '\\n');\n"
+    "  }\n"
+    "}\n"
+    "\n"
+    "async function partialRebuild() {\n"
+    "  if (!compiler) { await fullBuild(); return; }\n"
+    "  try {\n"
+    "    const scanner = new Scanner({\n"
+    "      sources: [{ base: join(BASE, 'src'), pattern: '**/*.{tsx,ts,jsx,js,html}', negated: false }]\n"
+    "    });\n"
+    "    const out = compiler.build(scanner.scan());\n"
+    "    writeFileSync(join(BASE, OUTPUT), out, 'utf8');\n"
+    "    process.stdout.write('[tw-done]\\n');\n"
+    "  } catch(e) {\n"
+    "    await fullBuild();\n"
+    "  }\n"
+    "}\n"
+    "\n"
+    "function schedule(full) {\n"
+    "  clearTimeout(timer);\n"
+    "  timer = setTimeout(full ? fullBuild : partialRebuild, 60);\n"
+    "}\n"
+    "\n"
+    "await fullBuild();\n"
+    "\n"
+    "watch(join(BASE, 'src'), { recursive: true }, (ev, f) => {\n"
+    "  if (!f) return;\n"
+    "  const ext = f.split('.').pop();\n"
+    "  const full = ext === 'css';\n"
+    "  if (['tsx','ts','jsx','js','css','html'].includes(ext)) schedule(full);\n"
+    "});\n";
+
 
 /* ── Global state ────────────────────────────────────────────────────────────── */
 
@@ -562,14 +635,15 @@ static void serve_html(sock_t s, const char *html_path) {
         return;
     }
 
-    const char *css_link  = "  <link rel=\"stylesheet\" href=\"/@cinder/style.css\">\n";
-    const char *tw_tag    = "  <script src=\"" TW_CDN "\"></script>\n";
+    const char *css_link       = "  <link rel=\"stylesheet\" href=\"/@cinder/style.css\">\n";
+    const char *bundle_css_link= "  <link rel=\"stylesheet\" href=\"/@cinder/bundle.css\">\n";
     const char *bundle_src = "src=\"/@cinder/bundle.js\"";
-    int inject_css = file_exists(STYLE_FILE);
+    int inject_tw_css     = file_exists(STYLE_FILE);
+    int inject_bundle_css = file_exists(BUNDLE_CSS_FILE);
 
-    size_t extra = 256 + strlen(HMR_SCRIPT)
-                       + (inject_css ? strlen(css_link) : 0)
-                       + (g_use_tw_cdn ? strlen(tw_tag) : 0);
+    size_t extra = 512 + strlen(HMR_SCRIPT)
+                       + (inject_tw_css     ? strlen(css_link)        : 0)
+                       + (inject_bundle_css ? strlen(bundle_css_link) : 0);
     char *out = (char *)malloc((size_t)sz + extra);
     if (!out) { free(html); return; }
 
@@ -578,15 +652,16 @@ static void serve_html(sock_t s, const char *html_path) {
     const char *end = html + sz;
 
     while (src < end) {
-        /* Before </head>: inject CSS link and/or Tailwind CDN */
+        /* Before </head>: inject CSS links */
         if (strncmp(src, "</head>", 7) == 0) {
-            if (inject_css) {
+            /* Tailwind-processed CSS (utilities) takes priority */
+            if (inject_tw_css) {
                 memcpy(dst, css_link, strlen(css_link));
                 dst += strlen(css_link);
-            }
-            if (g_use_tw_cdn) {
-                memcpy(dst, tw_tag, strlen(tw_tag));
-                dst += strlen(tw_tag);
+            } else if (inject_bundle_css) {
+                /* Fallback: esbuild-bundled CSS (has base styles, no utilities scan) */
+                memcpy(dst, bundle_css_link, strlen(bundle_css_link));
+                dst += strlen(bundle_css_link);
             }
             memcpy(dst, "</head>", 7); dst += 7; src += 7;
             continue;
@@ -677,11 +752,15 @@ static void handle_connection(sock_t s) {
         sock_close(s);
         return;
     }
+    if (strcmp(path, "/@cinder/bundle.css") == 0) {
+        if (file_exists(BUNDLE_CSS_FILE)) send_file(s, BUNDLE_CSS_FILE);
+        else send_response(s, 200, "OK", "text/css", "", 0);
+        sock_close(s);
+        return;
+    }
     if (strcmp(path, "/@cinder/style.css") == 0) {
         if (file_exists(STYLE_FILE)) send_file(s, STYLE_FILE);
-        else {
-            send_response(s, 200, "OK", "text/css", "", 0);
-        }
+        else send_response(s, 200, "OK", "text/css", "", 0);
         sock_close(s);
         return;
     }
@@ -874,6 +953,65 @@ static void *log_reader_thread(void *arg) {
 }
 #endif
 
+/* ── tw-watcher log reader thread (sends css-reload HMR on [tw-done]) ───────── */
+
+#ifdef _WIN32
+static DWORD WINAPI tw_log_reader_thread(LPVOID arg) {
+    HANDLE pipe = (HANDLE)arg;
+    char raw[2048];
+    char line[2048];
+    int  lpos = 0;
+    DWORD n;
+    while (ReadFile(pipe, raw, sizeof(raw) - 1, &n, NULL) && n > 0) {
+        for (DWORD i = 0; i < n; i++) {
+            char c = raw[i];
+            if (c == '\r') continue;
+            if (c == '\n') {
+                if (lpos > 0) {
+                    line[lpos] = '\0';
+                    if (strstr(line, "[tw-done]")) {
+                        ws_broadcast("{\"type\":\"css-reload\"}");
+                    }
+                    lpos = 0;
+                }
+            } else if (lpos < (int)sizeof(line) - 1) {
+                line[lpos++] = c;
+            }
+        }
+    }
+    CloseHandle(pipe);
+    return 0;
+}
+#else
+static void *tw_log_reader_thread(void *arg) {
+    int fd = *(int*)arg;
+    free(arg);
+    char raw[2048];
+    char line[2048];
+    int  lpos = 0;
+    ssize_t n;
+    while ((n = read(fd, raw, sizeof(raw) - 1)) > 0) {
+        for (ssize_t i = 0; i < n; i++) {
+            char c = raw[i];
+            if (c == '\r') continue;
+            if (c == '\n') {
+                if (lpos > 0) {
+                    line[lpos] = '\0';
+                    if (strstr(line, "[tw-done]")) {
+                        ws_broadcast("{\"type\":\"css-reload\"}");
+                    }
+                    lpos = 0;
+                }
+            } else if (lpos < (int)sizeof(line) - 1) {
+                line[lpos++] = c;
+            }
+        }
+    }
+    close(fd);
+    return NULL;
+}
+#endif
+
 /* ── devserver_discover ──────────────────────────────────────────────────────── */
 
 int devserver_discover(DevServerConfig *cfg, const char *root) {
@@ -1022,6 +1160,7 @@ int devserver_run(const DevServerConfig *cfg) {
         "--loader:.svg=dataurl "
         "--loader:.png=dataurl "
         "--loader:.jpg=dataurl "
+        "--loader:.gif=dataurl "
         "--loader:.woff=dataurl "
         "--loader:.woff2=dataurl "
         "--outfile=%s "
@@ -1041,11 +1180,52 @@ int devserver_run(const DevServerConfig *cfg) {
     g_esbuild_proc = spawn_background_piped(esbuild_cmd, &esbuild_pipe);
 #endif
 
-    /* ── Spawn tailwindcss --watch if available and CSS entry found ── */
-    if (cfg->tw_bin && cfg->css_entry) {
-        char tw_cmd[1024];
-        int tw_via_node = 0;
+    /* ── Spawn tw-watcher (Tailwind v4 via @tailwindcss/node) if CSS entry found ── */
+    if (cfg->css_entry) {
+        /* Check if @tailwindcss/node is available (Tailwind v4) */
+        int has_tw_node = 0;
         {
+            char probe_path[512];
+            snprintf(probe_path, sizeof(probe_path),
+                     "node_modules/@tailwindcss/node/dist/index.js");
+            FILE *f = fopen(probe_path, "r");
+            if (f) { fclose(f); has_tw_node = 1; }
+        }
+
+        if (has_tw_node) {
+            /* Write watcher script to .cinder/tw-watcher.mjs */
+            FILE *sf = fopen(TW_WATCHER_JS, "w");
+            if (sf) {
+                fputs(TW_WATCHER_SCRIPT, sf);
+                fclose(sf);
+                char tw_cmd[512];
+                snprintf(tw_cmd, sizeof(tw_cmd),
+                         "node %s %s %s",
+                         TW_WATCHER_JS, cfg->css_entry, STYLE_FILE);
+#ifdef _WIN32
+                HANDLE tw_pipe = NULL;
+                g_tw_proc = spawn_background_piped(tw_cmd, &tw_pipe);
+                if (tw_pipe) {
+                    HANDLE tlt = CreateThread(NULL, 0, tw_log_reader_thread,
+                                              (LPVOID)tw_pipe, 0, NULL);
+                    if (tlt) CloseHandle(tlt);
+                }
+#else
+                int tw_pipe = -1;
+                g_tw_proc = spawn_background_piped(tw_cmd, &tw_pipe);
+                if (tw_pipe >= 0) {
+                    int *fdp = (int*)malloc(sizeof(int));
+                    *fdp = tw_pipe;
+                    pthread_t tlt;
+                    if (pthread_create(&tlt, NULL, tw_log_reader_thread, fdp) == 0)
+                        pthread_detach(tlt);
+                }
+#endif
+            }
+        } else if (cfg->tw_bin) {
+            /* Fallback: legacy tailwindcss CLI */
+            char tw_cmd[1024];
+            int tw_via_node = 0;
             FILE *probe = fopen(cfg->tw_bin, "r");
             if (probe) {
                 char head[4] = {0};
@@ -1053,18 +1233,17 @@ int devserver_run(const DevServerConfig *cfg) {
                 fclose(probe);
                 tw_via_node = (head[0] == '#');
             }
+            const char *ext = strrchr(cfg->tw_bin, '.');
+            if ((ext && strcmp(ext, ".js") == 0) || tw_via_node)
+                snprintf(tw_cmd, sizeof(tw_cmd),
+                         "node %s --input %s --output %s --watch",
+                         cfg->tw_bin, cfg->css_entry, STYLE_FILE);
+            else
+                snprintf(tw_cmd, sizeof(tw_cmd),
+                         "%s --input %s --output %s --watch",
+                         cfg->tw_bin, cfg->css_entry, STYLE_FILE);
+            g_tw_proc = spawn_background(tw_cmd);
         }
-        const char *ext = strrchr(cfg->tw_bin, '.');
-        if ((ext && strcmp(ext, ".js") == 0) || tw_via_node) {
-            snprintf(tw_cmd, sizeof(tw_cmd),
-                "node %s --input %s --output %s --watch",
-                cfg->tw_bin, cfg->css_entry, STYLE_FILE);
-        } else {
-            snprintf(tw_cmd, sizeof(tw_cmd),
-                "%s --input %s --output %s --watch",
-                cfg->tw_bin, cfg->css_entry, STYLE_FILE);
-        }
-        g_tw_proc = spawn_background(tw_cmd);
     }
 
     /* ── Start log reader thread (parses esbuild output, triggers HMR) ── */
