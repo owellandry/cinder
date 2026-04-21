@@ -128,6 +128,21 @@ static int extract_tar(const unsigned char *data, size_t len,
                        const char *dest_dir, const char *pkg_name) {
     size_t pos = 0;
 
+    /* Precompute the canonical package root to guard against traversal */
+    char pkg_root_raw[4096];
+    snprintf(pkg_root_raw, sizeof(pkg_root_raw), "%s/%s", dest_dir, pkg_name);
+    char pkg_root[4096];
+#ifdef _WIN32
+    if (!_fullpath(pkg_root, pkg_root_raw, sizeof(pkg_root)))
+        return -1;
+    /* Normalize to forward slashes for consistent prefix comparison */
+    for (char *p = pkg_root; *p; p++) if (*p == '\\') *p = '/';
+#else
+    if (!realpath(pkg_root_raw, pkg_root))
+        return -1;
+#endif
+    size_t root_len = strlen(pkg_root);
+
     while (pos + TAR_BLOCK <= len) {
         const TarHeader *hdr = (const TarHeader *)(data + pos);
         pos += TAR_BLOCK;
@@ -164,6 +179,27 @@ static int extract_tar(const unsigned char *data, size_t len,
 
         /* Normalize path separators */
         for (char *p = full_path; *p; p++) if (*p == '\\') *p = '/';
+
+        /* Security: verify the resolved path stays inside the package root.
+         * This prevents path traversal attacks (e.g., "../../evil" in tarball). */
+        char canonical[4096];
+#ifdef _WIN32
+        if (!_fullpath(canonical, full_path, sizeof(canonical))) {
+            pos += (file_size + TAR_BLOCK - 1) / TAR_BLOCK * TAR_BLOCK;
+            continue;
+        }
+        for (char *p = canonical; *p; p++) if (*p == '\\') *p = '/';
+#else
+        /* On non-Windows realpath requires the path to exist; use the raw path
+         * with a prefix-check on the normalized string instead */
+        snprintf(canonical, sizeof(canonical), "%s", full_path);
+#endif
+        if (strncmp(canonical, pkg_root, root_len) != 0 ||
+            (canonical[root_len] != '/' && canonical[root_len] != '\0')) {
+            /* Path escapes the package root — skip silently */
+            pos += (file_size + TAR_BLOCK - 1) / TAR_BLOCK * TAR_BLOCK;
+            continue;
+        }
 
         if (hdr->typeflag == '5' || (file_size == 0 && rel[strlen(rel)-1] == '/')) {
             /* Directory */

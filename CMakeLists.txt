@@ -4,11 +4,20 @@ project(cinder VERSION 0.1.0 LANGUAGES C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
+# Default to Release when no build type is specified
+if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 # ── Compiler flags ─────────────────────────────────────────────────────────────
 if(MSVC)
-    add_compile_options(/W3 /O2 /D_CRT_SECURE_NO_WARNINGS)
+    add_compile_options(/W3 /D_CRT_SECURE_NO_WARNINGS
+        $<$<CONFIG:Release>:/O2 /DNDEBUG>
+        $<$<CONFIG:Debug>:/Od /Zi>
+    )
 else()
-    add_compile_options(-Wall -Wextra -O2 -g)
+    # Warnings applied to all targets/configs
+    add_compile_options(-Wall -Wextra)
 endif()
 
 # ── Platform defines ───────────────────────────────────────────────────────────
@@ -68,6 +77,18 @@ set(CINDER_SOURCES
 )
 
 add_executable(cinder ${CINDER_SOURCES})
+
+target_compile_definitions(cinder PRIVATE _GNU_SOURCE)
+
+# Per-config optimization flags only for the cinder target (not vendored libs)
+if(NOT MSVC)
+    target_compile_options(cinder PRIVATE
+        $<$<CONFIG:Release>:-O3 -march=native -DNDEBUG>
+        $<$<CONFIG:Debug>:-O0 -g>
+    )
+    # LTO only for cinder (not QuickJS — can be fragile)
+    set_property(TARGET cinder PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+endif()
 
 target_compile_definitions(cinder PRIVATE _GNU_SOURCE)
 
