@@ -108,7 +108,7 @@ target_link_libraries(cinder PRIVATE
 )
 
 if(WIN32)
-    target_link_libraries(cinder PRIVATE ws2_32 bcrypt)
+    target_link_libraries(cinder PRIVATE ws2_32 mswsock bcrypt)
 elseif(UNIX)
     target_link_libraries(cinder PRIVATE m pthread dl)
 endif()

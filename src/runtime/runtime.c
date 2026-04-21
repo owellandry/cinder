@@ -38,9 +38,16 @@ CinderRuntime *cinder_runtime_new(int argc, char *argv[]) {
     cr->rt = JS_NewRuntime();
     if (!cr->rt) { free(cr); return NULL; }
 
-    /* Memory limit: 512 MB */
-    JS_SetMemoryLimit(cr->rt, 512 * 1024 * 1024);
+    /* Memory limits: configurable via CINDER_MAX_MEMORY (MB), default 256 MB */
+    size_t mem_limit = 256 * 1024 * 1024;
+    const char *env_mem = getenv("CINDER_MAX_MEMORY");
+    if (env_mem) {
+        unsigned long long v = strtoull(env_mem, NULL, 10);
+        if (v > 0) mem_limit = (size_t)(v * 1024 * 1024);
+    }
+    JS_SetMemoryLimit(cr->rt, mem_limit);
     JS_SetMaxStackSize(cr->rt, 8 * 1024 * 1024);
+    JS_SetGCThreshold(cr->rt, 32 * 1024 * 1024); /* GC more aggressively */
 
     cr->ctx = JS_NewContext(cr->rt);
     if (!cr->ctx) {

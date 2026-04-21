@@ -24,6 +24,7 @@
 #  include <windows.h>
 #  include <winsock2.h>
 #  include <ws2tcpip.h>
+#  include <mswsock.h>
 #  include <bcrypt.h>
 #  pragma comment(lib, "ws2_32.lib")
 #  pragma comment(lib, "bcrypt.lib")
@@ -174,6 +175,10 @@ static void ws_broadcast(const char *msg);
 static double g_build_start = 0;
 static char   g_build_file[256] = {0};
 
+/* HMR debounce: accumulate build-finished events for 80ms before reloading */
+static volatile int    g_hmr_pending = 0;
+static volatile double g_hmr_time    = 0;
+
 static void process_esbuild_line(const char *line) {
     if (strstr(line, "[watch] build started")) {
         g_build_start = log_now_ms();
@@ -210,14 +215,15 @@ static void process_esbuild_line(const char *line) {
                 printf("  \033[32m+\033[0m  \033[36m%s\033[0m  \033[2m(%.0fms)\033[0m\n",
                        base, elapsed);
             fflush(stdout);
-            /* Trigger HMR immediately */
-            ws_broadcast("{\"type\":\"reload\"}");
         } else {
             /* Initial bundle */
             printf("  \033[32m+\033[0m  \033[2mready\033[0m  \033[2m[%.0fms]\033[0m\n\n",
                    elapsed);
             fflush(stdout);
         }
+        /* Debounce: schedule reload 80ms from now (reset timer if already pending) */
+        g_hmr_time    = log_now_ms();
+        g_hmr_pending = 1;
         return;
     }
 
@@ -227,6 +233,34 @@ static void process_esbuild_line(const char *line) {
         fflush(stdout);
     }
 }
+
+/* ── HMR debounce thread (polls every 20ms, fires after 80ms of quiet) ───────── */
+
+#ifdef _WIN32
+static DWORD WINAPI hmr_debounce_thread(LPVOID arg) {
+    (void)arg;
+    while (g_server_running) {
+        Sleep(20);
+        if (g_hmr_pending && (log_now_ms() - g_hmr_time) >= 80.0) {
+            ws_broadcast("{\"type\":\"reload\"}");
+            g_hmr_pending = 0;
+        }
+    }
+    return 0;
+}
+#else
+static void *hmr_debounce_thread(void *arg) {
+    (void)arg;
+    while (g_server_running) {
+        usleep(20000); /* 20ms */
+        if (g_hmr_pending && (log_now_ms() - g_hmr_time) >= 80.0) {
+            ws_broadcast("{\"type\":\"reload\"}");
+            g_hmr_pending = 0;
+        }
+    }
+    return NULL;
+}
+#endif
 
 /* ── SHA-1 + Base64 for WebSocket handshake ─────────────────────────────────── */
 
@@ -448,8 +482,39 @@ static void send_response(sock_t s, int code, const char *status,
     }
 }
 
-/* Stream a file directly to socket without loading it all into memory */
+/* Stream a file directly to socket without loading it all into memory.
+ * On Windows: uses TransmitFile for zero-copy kernel-level transfer.
+ * On other platforms: 64KB read+send loop. */
 static void send_file(sock_t s, const char *path) {
+#ifdef _WIN32
+    HANDLE hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                               OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        const char *msg = "File not found";
+        send_response(s, 404, "Not Found", "text/plain", msg, (long)strlen(msg));
+        return;
+    }
+    LARGE_INTEGER li;
+    GetFileSizeEx(hFile, &li);
+    long sz = (long)li.QuadPart;
+
+    char hdr[512];
+    int hdr_len = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: %s\r\n"
+        "Content-Length: %ld\r\n"
+        "Cache-Control: no-cache\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Connection: close\r\n\r\n",
+        mime_for(path), sz);
+
+    TRANSMIT_FILE_BUFFERS tf = {0};
+    tf.Head       = hdr;
+    tf.HeadLength = (DWORD)hdr_len;
+    TransmitFile((SOCKET)s, hFile, 0, 0, NULL, &tf, 0);
+    CloseHandle(hFile);
+#else
+    /* POSIX fallback: 64KB read+send loop */
     FILE *f = fopen(path, "rb");
     if (!f) {
         const char *msg = "File not found";
@@ -483,6 +548,7 @@ static void send_file(sock_t s, const char *path) {
         }
     }
     fclose(f);
+#endif
 }
 
 /* Inject HMR script + cinder bundle/CSS references into index.html */
@@ -968,6 +1034,8 @@ int devserver_run(const DevServerConfig *cfg) {
     if (esbuild_pipe) {
         HANDLE lt = CreateThread(NULL, 0, log_reader_thread, (LPVOID)esbuild_pipe, 0, NULL);
         if (lt) CloseHandle(lt);
+        HANDLE dt = CreateThread(NULL, 0, hmr_debounce_thread, NULL, 0, NULL);
+        if (dt) CloseHandle(dt);
     }
 #else
     if (esbuild_pipe >= 0) {
@@ -976,6 +1044,9 @@ int devserver_run(const DevServerConfig *cfg) {
         pthread_t lt;
         if (pthread_create(&lt, NULL, log_reader_thread, fdp) == 0)
             pthread_detach(lt);
+        pthread_t dt;
+        if (pthread_create(&dt, NULL, hmr_debounce_thread, NULL) == 0)
+            pthread_detach(dt);
     }
 #endif
 

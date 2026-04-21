@@ -49,34 +49,6 @@ static void cache_path_for(const char *name, const char *version,
     }
 }
 
-/* ── Dynamic buffer ──────────────────────────────────────────────────────────── */
-
-typedef struct {
-    unsigned char *data;
-    size_t len;
-    size_t cap;
-} ByteBuf;
-
-static int bytebuf_append(ByteBuf *b, const void *ptr, size_t n) {
-    if (b->len + n > b->cap) {
-        size_t new_cap = b->cap == 0 ? (1 << 20) : b->cap * 2;
-        while (new_cap < b->len + n) new_cap *= 2;
-        unsigned char *tmp = (unsigned char *)realloc(b->data, new_cap);
-        if (!tmp) return -1;
-        b->data = tmp;
-        b->cap  = new_cap;
-    }
-    memcpy(b->data + b->len, ptr, n);
-    b->len += n;
-    return 0;
-}
-
-static size_t curl_write_bytes(void *ptr, size_t size, size_t nmemb, void *ud) {
-    ByteBuf *b = (ByteBuf *)ud;
-    size_t total = size * nmemb;
-    return bytebuf_append(b, ptr, total) == 0 ? total : 0;
-}
-
 /* ── mkdir -p ───────────────────────────────────────────────────────────────── */
 
 static int mkdirp(const char *path) {
@@ -124,239 +96,267 @@ typedef struct {
 
 #define TAR_BLOCK 512
 
-static int extract_tar(const unsigned char *data, size_t len,
-                       const char *dest_dir, const char *pkg_name) {
-    size_t pos = 0;
+/* ── Streaming tar+gzip state machine ─────────────────────────────────────── */
 
-    /* Precompute the canonical package root to guard against traversal */
-    char pkg_root_raw[4096];
-    snprintf(pkg_root_raw, sizeof(pkg_root_raw), "%s/%s", dest_dir, pkg_name);
-    char pkg_root[4096];
+typedef enum { TAR_NEED_HEADER, TAR_WRITE_DATA, TAR_SKIP_DATA } TarStreamState;
+
+typedef struct {
+    TarStreamState state;
+    unsigned char  hdr_buf[TAR_BLOCK];
+    size_t         hdr_pos;
+    FILE          *out_file;
+    size_t         data_remaining;
+    size_t         pad_remaining;
+    const char    *dest_dir;   /* points into task struct (stays valid) */
+    const char    *pkg_name;   /* points into task struct (stays valid) */
+    char           pkg_root[4096];
+    size_t         pkg_root_len;
+    int            error;
+    int            done;
+} TarStream;
+
+/* Forward declarations */
+static void process_tar_header(TarStream *ts);
+static int  tar_stream_feed(TarStream *ts, const unsigned char *data, size_t len);
+
+static void process_tar_header(TarStream *ts) {
+    const TarHeader *hdr = (const TarHeader *)ts->hdr_buf;
+
+    if (hdr->name[0] == '\0') { ts->done = 1; return; }
+
+    size_t file_size = (size_t)strtoul(hdr->size, NULL, 8);
+    size_t padded    = (file_size + (TAR_BLOCK - 1)) / TAR_BLOCK * TAR_BLOCK;
+    size_t pad       = padded - file_size;
+
+    char rel[512];
+    if (hdr->prefix[0])
+        snprintf(rel, sizeof(rel), "%s/%s", hdr->prefix, hdr->name);
+    else
+        snprintf(rel, sizeof(rel), "%s", hdr->name);
+
+    /* Strip leading path component ("package/") */
+    const char *stripped = strchr(rel, '/');
+    if (!stripped || stripped[1] == '\0') {
+        ts->data_remaining = 0;
+        ts->pad_remaining  = padded;
+        ts->state          = TAR_SKIP_DATA;
+        return;
+    }
+    stripped++;
+
+    char full_path[4096];
+    snprintf(full_path, sizeof(full_path), "%s/%s/%s",
+             ts->dest_dir, ts->pkg_name, stripped);
+    for (char *p = full_path; *p; p++) if (*p == '\\') *p = '/';
+
+    /* Security: verify resolved path stays inside pkg_root */
+    char canonical[4096];
 #ifdef _WIN32
-    if (!_fullpath(pkg_root, pkg_root_raw, sizeof(pkg_root)))
-        return -1;
-    /* Normalize to forward slashes for consistent prefix comparison */
-    for (char *p = pkg_root; *p; p++) if (*p == '\\') *p = '/';
+    if (!_fullpath(canonical, full_path, sizeof(canonical))) {
+        ts->data_remaining = 0; ts->pad_remaining = padded;
+        ts->state = TAR_SKIP_DATA; return;
+    }
+    for (char *p = canonical; *p; p++) if (*p == '\\') *p = '/';
 #else
-    if (!realpath(pkg_root_raw, pkg_root))
-        return -1;
+    snprintf(canonical, sizeof(canonical), "%s", full_path);
 #endif
-    size_t root_len = strlen(pkg_root);
+    if (strncmp(canonical, ts->pkg_root, ts->pkg_root_len) != 0 ||
+        (canonical[ts->pkg_root_len] != '/' && canonical[ts->pkg_root_len] != '\0')) {
+        ts->data_remaining = 0; ts->pad_remaining = padded;
+        ts->state = TAR_SKIP_DATA; return;
+    }
 
-    while (pos + TAR_BLOCK <= len) {
-        const TarHeader *hdr = (const TarHeader *)(data + pos);
-        pos += TAR_BLOCK;
-
-        /* End-of-archive: two zero blocks */
-        if (hdr->name[0] == '\0') continue;
-
-        /* File size from octal string */
-        size_t file_size = (size_t)strtoul(hdr->size, NULL, 8);
-
-        /* Build output path: strip first component ("package/") and
-         * replace with node_modules/<pkg_name>/ */
-        char rel[512];
-        char full_path[4096];
-
-        /* Reconstruct path (prefix + name for GNU/POSIX) */
-        if (hdr->prefix[0]) {
-            snprintf(rel, sizeof(rel), "%s/%s", hdr->prefix, hdr->name);
+    if (hdr->typeflag == '5' ||
+        (file_size == 0 && rel[strlen(rel)-1] == '/')) {
+        /* Directory */
+        mkdirp(full_path);
+        ts->data_remaining = 0; ts->pad_remaining = padded;
+        ts->state = TAR_SKIP_DATA;
+    } else if (hdr->typeflag == '0' || hdr->typeflag == '\0') {
+        /* Regular file */
+        char parent[4096];
+        snprintf(parent, sizeof(parent), "%s", full_path);
+        char *slash = strrchr(parent, '/');
+        if (slash) { *slash = '\0'; mkdirp(parent); }
+        ts->out_file       = fopen(full_path, "wb");
+        ts->data_remaining = file_size;
+        ts->pad_remaining  = pad;
+        if (file_size == 0) {
+            if (ts->out_file) { fclose(ts->out_file); ts->out_file = NULL; }
+            ts->state = TAR_SKIP_DATA;
         } else {
-            snprintf(rel, sizeof(rel), "%s", hdr->name);
+            ts->state = TAR_WRITE_DATA;
         }
+    } else {
+        /* Symlink, device, etc. — skip */
+        ts->data_remaining = 0; ts->pad_remaining = padded;
+        ts->state = TAR_SKIP_DATA;
+    }
+}
 
-        /* Strip first path component (e.g., "package/") */
-        const char *stripped = strchr(rel, '/');
-        if (!stripped) {
-            /* Skip top-level entries with no subdir */
-            pos += (file_size + TAR_BLOCK - 1) / TAR_BLOCK * TAR_BLOCK;
-            continue;
+static int tar_stream_feed(TarStream *ts, const unsigned char *data, size_t len) {
+    size_t pos = 0;
+    while (pos < len && !ts->done && !ts->error) {
+        switch (ts->state) {
+            case TAR_NEED_HEADER: {
+                size_t need  = TAR_BLOCK - ts->hdr_pos;
+                size_t avail = len - pos;
+                size_t copy  = need < avail ? need : avail;
+                memcpy(ts->hdr_buf + ts->hdr_pos, data + pos, copy);
+                ts->hdr_pos += copy;
+                pos += copy;
+                if (ts->hdr_pos == TAR_BLOCK) {
+                    ts->hdr_pos = 0;
+                    process_tar_header(ts);
+                }
+                break;
+            }
+            case TAR_WRITE_DATA: {
+                size_t avail    = len - pos;
+                size_t to_write = ts->data_remaining < avail ? ts->data_remaining : avail;
+                if (ts->out_file) {
+                    if (fwrite(data + pos, 1, to_write, ts->out_file) != to_write)
+                        ts->error = 1;
+                }
+                ts->data_remaining -= to_write;
+                pos += to_write;
+                if (ts->data_remaining == 0) {
+                    if (ts->out_file) { fclose(ts->out_file); ts->out_file = NULL; }
+                    ts->state = ts->pad_remaining > 0 ? TAR_SKIP_DATA : TAR_NEED_HEADER;
+                }
+                break;
+            }
+            case TAR_SKIP_DATA: {
+                size_t avail   = len - pos;
+                size_t to_skip = ts->pad_remaining < avail ? ts->pad_remaining : avail;
+                ts->pad_remaining -= to_skip;
+                pos += to_skip;
+                if (ts->pad_remaining == 0) ts->state = TAR_NEED_HEADER;
+                break;
+            }
         }
-        stripped++; /* skip the '/' */
+    }
+    return ts->error;
+}
 
-        snprintf(full_path, sizeof(full_path), "%s/%s/%s",
-                 dest_dir, pkg_name, stripped);
+typedef struct {
+    z_stream      zs;
+    TarStream     ts;
+    unsigned char inflate_buf[65536];
+    FILE         *cache_file;  /* simultaneously write raw bytes to cache */
+    char          cache_path[4096]; /* for cleanup on error */
+    int           error;
+} StreamCtx;
 
-        /* Normalize path separators */
-        for (char *p = full_path; *p; p++) if (*p == '\\') *p = '/';
-
-        /* Security: verify the resolved path stays inside the package root.
-         * This prevents path traversal attacks (e.g., "../../evil" in tarball). */
-        char canonical[4096];
+static int stream_ctx_init(StreamCtx *sc, const char *dest_dir,
+                           const char *pkg_name, const char *cache_path) {
+    memset(sc, 0, sizeof(*sc));
+    if (inflateInit2(&sc->zs, 16 + MAX_WBITS) != Z_OK) return -1;
+    sc->ts.state    = TAR_NEED_HEADER;
+    sc->ts.dest_dir = dest_dir;
+    sc->ts.pkg_name = pkg_name;
+    /* Precompute canonical package root */
+    char raw_root[4096];
+    snprintf(raw_root, sizeof(raw_root), "%s/%s", dest_dir, pkg_name);
 #ifdef _WIN32
-        if (!_fullpath(canonical, full_path, sizeof(canonical))) {
-            pos += (file_size + TAR_BLOCK - 1) / TAR_BLOCK * TAR_BLOCK;
-            continue;
-        }
-        for (char *p = canonical; *p; p++) if (*p == '\\') *p = '/';
+    if (!_fullpath(sc->ts.pkg_root, raw_root, sizeof(sc->ts.pkg_root))) {
+        inflateEnd(&sc->zs); return -1;
+    }
+    for (char *p = sc->ts.pkg_root; *p; p++) if (*p == '\\') *p = '/';
 #else
-        /* On non-Windows realpath requires the path to exist; use the raw path
-         * with a prefix-check on the normalized string instead */
-        snprintf(canonical, sizeof(canonical), "%s", full_path);
+    snprintf(sc->ts.pkg_root, sizeof(sc->ts.pkg_root), "%s", raw_root);
 #endif
-        if (strncmp(canonical, pkg_root, root_len) != 0 ||
-            (canonical[root_len] != '/' && canonical[root_len] != '\0')) {
-            /* Path escapes the package root — skip silently */
-            pos += (file_size + TAR_BLOCK - 1) / TAR_BLOCK * TAR_BLOCK;
-            continue;
-        }
-
-        if (hdr->typeflag == '5' || (file_size == 0 && rel[strlen(rel)-1] == '/')) {
-            /* Directory */
-            mkdirp(full_path);
-        } else if (hdr->typeflag == '0' || hdr->typeflag == '\0') {
-            /* Regular file — ensure parent dir exists */
-            char parent[4096];
-            snprintf(parent, sizeof(parent), "%s", full_path);
-            char *slash = strrchr(parent, '/');
-            if (slash) {
-                *slash = '\0';
-                mkdirp(parent);
-            }
-
-            FILE *f = fopen(full_path, "wb");
-            if (f) {
-                if (pos + file_size <= len)
-                    fwrite(data + pos, 1, file_size, f);
-                fclose(f);
-            }
-        }
-
-        /* Advance past file data (rounded up to 512-byte blocks) */
-        pos += (file_size + TAR_BLOCK - 1) / TAR_BLOCK * TAR_BLOCK;
+    sc->ts.pkg_root_len = strlen(sc->ts.pkg_root);
+    if (cache_path) {
+        installer_cache_init();
+        mkdirp(g_cache_dir);
+        strncpy(sc->cache_path, cache_path, sizeof(sc->cache_path) - 1);
+        sc->cache_file = fopen(cache_path, "wb"); /* NULL is OK; just won't cache */
     }
-
     return 0;
 }
 
-/* ── Decompress gzip → raw tar bytes ─────────────────────────────────────────── */
-
-static int gunzip(const unsigned char *in, size_t in_len,
-                  unsigned char **out, size_t *out_len) {
-    z_stream zs;
-    memset(&zs, 0, sizeof(zs));
-
-    /* 16 + MAX_WBITS = decode gzip */
-    if (inflateInit2(&zs, 16 + MAX_WBITS) != Z_OK) return -1;
-
-    size_t cap = in_len * 4;
-    unsigned char *buf = (unsigned char *)malloc(cap);
-    if (!buf) { inflateEnd(&zs); return -1; }
-
-    zs.next_in  = (Bytef *)in;
-    zs.avail_in = (uInt)in_len;
-
-    size_t total = 0;
-    int ret;
-
-    do {
-        if (total >= cap) {
-            cap *= 2;
-            unsigned char *tmp = (unsigned char *)realloc(buf, cap);
-            if (!tmp) { free(buf); inflateEnd(&zs); return -1; }
-            buf = tmp;
-        }
-        zs.next_out  = buf + total;
-        zs.avail_out = (uInt)(cap - total);
-
-        ret = inflate(&zs, Z_NO_FLUSH);
-        total = cap - zs.avail_out;
-
-    } while (ret == Z_OK);
-
-    inflateEnd(&zs);
-
-    if (ret != Z_STREAM_END) {
-        free(buf);
-        return -1;
+static void stream_ctx_cleanup(StreamCtx *sc, int success) {
+    if (sc->ts.out_file) { fclose(sc->ts.out_file); sc->ts.out_file = NULL; }
+    inflateEnd(&sc->zs);
+    if (sc->cache_file) {
+        fclose(sc->cache_file);
+        sc->cache_file = NULL;
+        /* Remove partial cache file on failure */
+        if (!success && sc->cache_path[0]) remove(sc->cache_path);
     }
-
-    *out     = buf;
-    *out_len = total;
-    return 0;
 }
 
-/* ── Decompress + extract a .tgz buffer ──────────────────────────────────────── */
+static size_t streaming_write_cb(void *ptr, size_t size, size_t nmemb, void *ud) {
+    StreamCtx *sc = (StreamCtx *)ud;
+    size_t total = size * nmemb;
+    if (sc->error) return 0;
 
-static int decompress_and_extract(const unsigned char *tgz_data, size_t tgz_len,
-                                  const char *dest_dir, const char *pkg_name) {
-    unsigned char *tar_data = NULL;
-    size_t tar_len = 0;
+    /* Mirror raw compressed bytes to cache file */
+    if (sc->cache_file) fwrite(ptr, 1, total, sc->cache_file);
 
-    if (gunzip(tgz_data, tgz_len, &tar_data, &tar_len) != 0)
-        return -1;
-
-    mkdirp(dest_dir);
-    int ret = extract_tar(tar_data, tar_len, dest_dir, pkg_name);
-    free(tar_data);
-    return ret;
+    /* Inflate + feed to tar state machine */
+    sc->zs.next_in  = (Bytef *)ptr;
+    sc->zs.avail_in = (uInt)total;
+    while (sc->zs.avail_in > 0) {
+        sc->zs.next_out  = sc->inflate_buf;
+        sc->zs.avail_out = (uInt)sizeof(sc->inflate_buf);
+        int ret  = inflate(&sc->zs, Z_NO_FLUSH);
+        size_t have = sizeof(sc->inflate_buf) - sc->zs.avail_out;
+        if (have > 0 && tar_stream_feed(&sc->ts, sc->inflate_buf, have) != 0) {
+            sc->error = 1; return 0;
+        }
+        if (ret == Z_STREAM_END) break;
+        if (ret != Z_OK) { sc->error = 1; return 0; }
+    }
+    return total;
 }
 
-/* ── Cache helpers ───────────────────────────────────────────────────────────── */
-
-static int cache_load(const char *name, const char *version,
-                      unsigned char **out, size_t *out_len) {
-    char path[4096];
-    cache_path_for(name, version, path, sizeof(path));
-
-    FILE *f = fopen(path, "rb");
+/* Stream-extract from an already-cached .tgz file (zero extra heap alloc) */
+static int extract_from_cache(const char *cache_path, const char *dest_dir,
+                               const char *pkg_name) {
+    FILE *f = fopen(cache_path, "rb");
     if (!f) return -1;
-
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (sz <= 0) { fclose(f); return -1; }
-
-    unsigned char *buf = (unsigned char *)malloc((size_t)sz);
-    if (!buf) { fclose(f); return -1; }
-    if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
-        free(buf); fclose(f); return -1;
-    }
+    StreamCtx sc;
+    if (stream_ctx_init(&sc, dest_dir, pkg_name, NULL) != 0) { fclose(f); return -1; }
+    unsigned char buf[65536];
+    size_t n;
+    while (!sc.error && (n = fread(buf, 1, sizeof(buf), f)) > 0)
+        streaming_write_cb(buf, 1, n, &sc);
     fclose(f);
-
-    *out = buf;
-    *out_len = (size_t)sz;
-    return 0;
-}
-
-static void cache_store(const char *name, const char *version,
-                        const unsigned char *data, size_t len) {
-    installer_cache_init();
-    mkdirp(g_cache_dir);
-
-    char path[4096];
-    cache_path_for(name, version, path, sizeof(path));
-
-    FILE *f = fopen(path, "wb");
-    if (f) {
-        fwrite(data, 1, len, f);
-        fclose(f);
-    }
+    int ok = !sc.error;
+    stream_ctx_cleanup(&sc, ok);
+    return ok ? 0 : -1;
 }
 
 /* ── installer_download_and_extract (single, original API) ───────────────────── */
 
-int installer_download_and_extract(const char *pkg_name,
-                                   const char *version,
-                                   const char *tarball_url,
-                                   const char *dest_dir) {
+int installer_download_and_extract(const char *pkg_name, const char *version,
+                                   const char *tarball_url, const char *dest_dir) {
+    installer_cache_init();
+
     /* Try cache first */
-    unsigned char *cached = NULL;
-    size_t cached_len = 0;
-    if (cache_load(pkg_name, version, &cached, &cached_len) == 0) {
-        int ret = decompress_and_extract(cached, cached_len, dest_dir, pkg_name);
-        free(cached);
-        return ret;
+    char cache_path[4096];
+    cache_path_for(pkg_name, version, cache_path, sizeof(cache_path));
+    {
+        FILE *probe = fopen(cache_path, "rb");
+        if (probe) {
+            fclose(probe);
+            return extract_from_cache(cache_path, dest_dir, pkg_name);
+        }
     }
 
-    /* ── Download ─── */
-    CURL *curl = curl_easy_init();
-    if (!curl) return -1;
+    /* Not cached — stream download + decompress + extract */
+    StreamCtx sc;
+    if (stream_ctx_init(&sc, dest_dir, pkg_name, cache_path) != 0) return -1;
 
-    ByteBuf raw = {0};
+    CURL *curl = curl_easy_init();
+    if (!curl) { stream_ctx_cleanup(&sc, 0); return -1; }
+
+    mkdirp(dest_dir);
     curl_easy_setopt(curl, CURLOPT_URL, tarball_url);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_bytes);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &raw);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, streaming_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &sc);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "cinder/0.1.0");
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
@@ -365,26 +365,20 @@ int installer_download_and_extract(const char *pkg_name,
     CURLcode res = curl_easy_perform(curl);
     curl_easy_cleanup(curl);
 
-    if (res != CURLE_OK) {
+    int ok = (res == CURLE_OK && !sc.error);
+    if (!ok && res != CURLE_OK)
         fprintf(stderr, "cinder: download failed for %s: %s\n",
                 pkg_name, curl_easy_strerror(res));
-        free(raw.data);
-        return -1;
-    }
-
-    /* Save to cache */
-    cache_store(pkg_name, version, raw.data, raw.len);
-
-    int ret = decompress_and_extract(raw.data, raw.len, dest_dir, pkg_name);
-    free(raw.data);
-    return ret;
+    stream_ctx_cleanup(&sc, ok);
+    return ok ? 0 : -1;
 }
 
 /* ── Parallel bulk installer (curl_multi) ────────────────────────────────────── */
 
 typedef struct {
     InstallTask *task;
-    ByteBuf      buf;
+    StreamCtx    sc;
+    char         cache_path[4096];
     int          from_cache;
 } MultiCtx;
 
@@ -401,13 +395,12 @@ int installer_download_multi(InstallTask *tasks, int count, int max_parallel) {
     if (!need_dl) return 0;
 
     for (int i = 0; i < count; i++) {
-        unsigned char *cached = NULL;
-        size_t cached_len = 0;
-        if (cache_load(tasks[i].pkg_name, tasks[i].version,
-                       &cached, &cached_len) == 0) {
-            if (decompress_and_extract(cached, cached_len,
-                                       tasks[i].dest_dir,
-                                       tasks[i].pkg_name) == 0) {
+        char cp[4096];
+        cache_path_for(tasks[i].pkg_name, tasks[i].version, cp, sizeof(cp));
+        FILE *probe = fopen(cp, "rb");
+        if (probe) {
+            fclose(probe);
+            if (extract_from_cache(cp, tasks[i].dest_dir, tasks[i].pkg_name) == 0) {
                 tasks[i].result = 0;
                 ok_count++;
             } else {
@@ -415,7 +408,6 @@ int installer_download_multi(InstallTask *tasks, int count, int max_parallel) {
                 need_dl[i] = 1;
                 need_download++;
             }
-            free(cached);
         } else {
             need_dl[i] = 1;
             need_download++;
@@ -444,13 +436,22 @@ int installer_download_multi(InstallTask *tasks, int count, int max_parallel) {
         CURL *easy = curl_easy_init();
         if (!easy) { tasks[i].result = -1; continue; }
 
-        ctxs[i].task = &tasks[i];
-        ctxs[i].buf  = (ByteBuf){0};
+        ctxs[i].task       = &tasks[i];
         ctxs[i].from_cache = 0;
+        cache_path_for(tasks[i].pkg_name, tasks[i].version,
+                       ctxs[i].cache_path, sizeof(ctxs[i].cache_path));
+
+        mkdirp(tasks[i].dest_dir);
+        if (stream_ctx_init(&ctxs[i].sc, tasks[i].dest_dir, tasks[i].pkg_name,
+                            ctxs[i].cache_path) != 0) {
+            curl_easy_cleanup(easy);
+            tasks[i].result = -1;
+            continue;
+        }
 
         curl_easy_setopt(easy, CURLOPT_URL, tasks[i].tarball_url);
-        curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, curl_write_bytes);
-        curl_easy_setopt(easy, CURLOPT_WRITEDATA, &ctxs[i].buf);
+        curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, streaming_write_cb);
+        curl_easy_setopt(easy, CURLOPT_WRITEDATA, &ctxs[i].sc);
         curl_easy_setopt(easy, CURLOPT_USERAGENT, "cinder/0.1.0");
         curl_easy_setopt(easy, CURLOPT_FOLLOWLOCATION, 1L);
         curl_easy_setopt(easy, CURLOPT_TIMEOUT, 60L);
@@ -463,6 +464,7 @@ int installer_download_multi(InstallTask *tasks, int count, int max_parallel) {
         curl_multi_add_handle(multi, easy);
         active_count++;
     }
+    (void)active_count;
 
     /* Event loop: process transfers and extract as they complete */
     int still_running = 0;
@@ -480,30 +482,19 @@ int installer_download_multi(InstallTask *tasks, int count, int max_parallel) {
             MultiCtx *ctx = NULL;
             curl_easy_getinfo(easy, CURLINFO_PRIVATE, &ctx);
 
-            if (msg->data.result == CURLE_OK && ctx) {
-                /* Cache the downloaded tarball */
-                cache_store(ctx->task->pkg_name, ctx->task->version,
-                            ctx->buf.data, ctx->buf.len);
-
-                if (decompress_and_extract(ctx->buf.data, ctx->buf.len,
-                                           ctx->task->dest_dir,
-                                           ctx->task->pkg_name) == 0) {
-                    ctx->task->result = 0;
-                    ok_count++;
-                } else {
-                    ctx->task->result = -1;
-                    fprintf(stderr, "  error  Failed to extract '%s'\n",
-                            ctx->task->pkg_name);
-                }
+            if (msg->data.result == CURLE_OK && ctx && !ctx->sc.error) {
+                ctx->task->result = 0;
+                ok_count++;
+                stream_ctx_cleanup(&ctx->sc, 1);
             } else {
                 if (ctx) {
                     ctx->task->result = -1;
-                    fprintf(stderr, "  error  Download failed for '%s'\n",
+                    fprintf(stderr, "  error  Download/extract failed for '%s'\n",
                             ctx->task->pkg_name);
+                    stream_ctx_cleanup(&ctx->sc, 0);
                 }
             }
 
-            if (ctx) free(ctx->buf.data);
             curl_multi_remove_handle(multi, easy);
             curl_easy_cleanup(easy);
         }
