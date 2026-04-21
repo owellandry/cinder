@@ -1,6 +1,7 @@
 /*
  * cinder — npm registry client
- * Fetches package metadata using libcurl + cJSON
+ * Fetches package metadata using libcurl + cJSON.
+ * Supports parallel bulk fetches via curl_multi and abbreviated metadata.
  */
 #include "registry.h"
 #include "resolver.h"
@@ -40,49 +41,27 @@ static size_t curl_write_cb(void *ptr, size_t size, size_t nmemb, void *userdata
     return total;
 }
 
-/* ── HTTP GET helper ─────────────────────────────────────────────────────────── */
+/* ── Shared curl setup for registry requests ─────────────────────────────────── */
 
-static char *http_get(const char *url) {
-    CURL *curl = curl_easy_init();
-    if (!curl) return NULL;
-
-    DynBuf buf = {0};
-
+static void registry_curl_setup(CURL *curl, const char *url,
+                                DynBuf *buf, struct curl_slist *headers) {
     curl_easy_setopt(curl, CURLOPT_URL, url);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, buf);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, "cinder/0.1.0");
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
+    if (headers)
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     cinder_curl_ssl_setup(curl);
-
-    CURLcode res = curl_easy_perform(curl);
-    long http_code = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-    curl_easy_cleanup(curl);
-
-    if (res != CURLE_OK || http_code < 200 || http_code >= 300) {
-        free(buf.data);
-        return NULL;
-    }
-
-    return buf.data; /* caller must free */
 }
 
-/* ── registry_fetch ──────────────────────────────────────────────────────────── */
+/* ── Parse JSON response into PkgInfo ────────────────────────────────────────── */
 
-PkgInfo *registry_fetch(const char *name) {
-    char url[2048];
-    snprintf(url, sizeof(url), "%s/%s", NPM_REGISTRY, name);
-
-    char *json_str = http_get(url);
-    if (!json_str) {
-        fprintf(stderr, "cinder: failed to fetch package '%s' from registry\n", name);
-        return NULL;
-    }
-
+static PkgInfo *parse_pkg_json(const char *json_str, const char *name) {
     cJSON *root = cJSON_Parse(json_str);
-    free(json_str);
     if (!root) {
         fprintf(stderr, "cinder: invalid JSON response for package '%s'\n", name);
         return NULL;
@@ -95,7 +74,7 @@ PkgInfo *registry_fetch(const char *name) {
     cJSON *jname = cJSON_GetObjectItemCaseSensitive(root, "name");
     if (cJSON_IsString(jname)) info->name = strdup(jname->valuestring);
 
-    /* description */
+    /* description (may be absent in abbreviated metadata) */
     cJSON *jdesc = cJSON_GetObjectItemCaseSensitive(root, "description");
     if (cJSON_IsString(jdesc)) info->description = strdup(jdesc->valuestring);
 
@@ -131,6 +110,128 @@ PkgInfo *registry_fetch(const char *name) {
 
     cJSON_Delete(root);
     return info;
+}
+
+/* ── registry_fetch (single, original API) ───────────────────────────────────── */
+
+PkgInfo *registry_fetch(const char *name) {
+    char url[2048];
+    snprintf(url, sizeof(url), "%s/%s", NPM_REGISTRY, name);
+
+    CURL *curl = curl_easy_init();
+    if (!curl) return NULL;
+
+    DynBuf buf = {0};
+    struct curl_slist *headers = NULL;
+    headers = curl_slist_append(headers,
+        "Accept: application/vnd.npm.install-v1+json");
+    registry_curl_setup(curl, url, &buf, headers);
+
+    CURLcode res = curl_easy_perform(curl);
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    curl_easy_cleanup(curl);
+    curl_slist_free_all(headers);
+
+    if (res != CURLE_OK || http_code < 200 || http_code >= 300) {
+        fprintf(stderr, "cinder: failed to fetch package '%s' from registry\n", name);
+        free(buf.data);
+        return NULL;
+    }
+
+    PkgInfo *info = parse_pkg_json(buf.data, name);
+    free(buf.data);
+    return info;
+}
+
+/* ── registry_fetch_multi (parallel via curl_multi) ──────────────────────────── */
+
+typedef struct {
+    const char *name;
+    DynBuf      buf;
+    int         index;
+} FetchCtx;
+
+int registry_fetch_multi(const char **names, int count,
+                         PkgInfo **results, int max_parallel) {
+    if (count == 0) return 0;
+    if (max_parallel <= 0) max_parallel = 8;
+
+    for (int i = 0; i < count; i++) results[i] = NULL;
+
+    CURLM *multi = curl_multi_init();
+    if (!multi) return 0;
+
+    curl_multi_setopt(multi, CURLMOPT_MAX_TOTAL_CONNECTIONS, (long)max_parallel);
+    curl_multi_setopt(multi, CURLMOPT_PIPELINING, CURLPIPE_MULTIPLEX);
+
+    struct curl_slist *headers = NULL;
+    headers = curl_slist_append(headers,
+        "Accept: application/vnd.npm.install-v1+json");
+
+    FetchCtx *ctxs = (FetchCtx *)calloc((size_t)count, sizeof(FetchCtx));
+    if (!ctxs) {
+        curl_slist_free_all(headers);
+        curl_multi_cleanup(multi);
+        return 0;
+    }
+
+    for (int i = 0; i < count; i++) {
+        CURL *easy = curl_easy_init();
+        if (!easy) continue;
+
+        char url[2048];
+        snprintf(url, sizeof(url), "%s/%s", NPM_REGISTRY, names[i]);
+
+        ctxs[i].name  = names[i];
+        ctxs[i].buf   = (DynBuf){0};
+        ctxs[i].index = i;
+
+        registry_curl_setup(easy, url, &ctxs[i].buf, headers);
+        curl_easy_setopt(easy, CURLOPT_PRIVATE, &ctxs[i]);
+        curl_multi_add_handle(multi, easy);
+    }
+
+    int ok_count = 0;
+    int still_running = 0;
+
+    do {
+        CURLMcode mc = curl_multi_perform(multi, &still_running);
+        if (mc != CURLM_OK) break;
+
+        CURLMsg *msg;
+        int msgs_left;
+        while ((msg = curl_multi_info_read(multi, &msgs_left))) {
+            if (msg->msg != CURLMSG_DONE) continue;
+
+            CURL *easy = msg->easy_handle;
+            FetchCtx *ctx = NULL;
+            curl_easy_getinfo(easy, CURLINFO_PRIVATE, &ctx);
+
+            if (msg->data.result == CURLE_OK && ctx) {
+                long http_code = 0;
+                curl_easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &http_code);
+                if (http_code >= 200 && http_code < 300 && ctx->buf.data) {
+                    results[ctx->index] = parse_pkg_json(ctx->buf.data,
+                                                          ctx->name);
+                    if (results[ctx->index]) ok_count++;
+                }
+            }
+
+            if (ctx) free(ctx->buf.data);
+            curl_multi_remove_handle(multi, easy);
+            curl_easy_cleanup(easy);
+        }
+
+        if (still_running)
+            curl_multi_wait(multi, NULL, 0, 200, NULL);
+
+    } while (still_running);
+
+    free(ctxs);
+    curl_slist_free_all(headers);
+    curl_multi_cleanup(multi);
+    return ok_count;
 }
 
 /* ── registry_resolve_version ────────────────────────────────────────────────── */

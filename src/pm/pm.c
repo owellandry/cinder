@@ -219,7 +219,30 @@ int pm_init(void) {
     return 0;
 }
 
-/* ── pm_install ───────────────────────────────────────────────────────────────  */
+/* ── Dependency collection helper ─────────────────────────────────────────────  */
+
+typedef struct {
+    char  name[512];
+    char  range[128];
+} DepEntry;
+
+static int collect_deps(cJSON *obj, DepEntry *out, int max) {
+    int n = 0;
+    if (!obj) return 0;
+    cJSON *item;
+    cJSON_ArrayForEach(item, obj) {
+        if (n >= max) break;
+        strncpy(out[n].name, item->string, sizeof(out[n].name) - 1);
+        out[n].name[sizeof(out[n].name) - 1] = '\0';
+        const char *r = cJSON_IsString(item) ? item->valuestring : "latest";
+        strncpy(out[n].range, r, sizeof(out[n].range) - 1);
+        out[n].range[sizeof(out[n].range) - 1] = '\0';
+        n++;
+    }
+    return n;
+}
+
+/* ── pm_install (parallel) ────────────────────────────────────────────────────  */
 
 int pm_install(void) {
     cJSON *root = load_pkg_json();
@@ -230,30 +253,178 @@ int pm_install(void) {
 
     double t0 = pm_now_ms();
     CinderLockFile *lf = lockfile_load();
-    int errors = 0, total = 0;
 
     printf("\n");
 
+    /* Phase 1: collect all dependencies */
+    DepEntry all_deps[1024];
+    int dep_count = 0;
+
     cJSON *deps = cJSON_GetObjectItemCaseSensitive(root, "dependencies");
-    if (deps) {
-        cJSON *item;
-        cJSON_ArrayForEach(item, deps) {
-            const char *range = cJSON_IsString(item) ? item->valuestring : "latest";
-            if (install_one(item->string, range, lf)) total++;
-            else errors++;
-        }
-    }
+    dep_count += collect_deps(deps, all_deps + dep_count,
+                              1024 - dep_count);
 
     cJSON *dev = cJSON_GetObjectItemCaseSensitive(root, "devDependencies");
-    if (dev) {
-        cJSON *item;
-        cJSON_ArrayForEach(item, dev) {
-            const char *range = cJSON_IsString(item) ? item->valuestring : "latest";
-            if (install_one(item->string, range, lf)) total++;
-            else errors++;
+    dep_count += collect_deps(dev, all_deps + dep_count,
+                              1024 - dep_count);
+
+    if (dep_count == 0) {
+        printf("  No dependencies to install\n\n");
+        lockfile_free(lf);
+        cJSON_Delete(root);
+        return 0;
+    }
+
+    /* Phase 2: classify — cached vs needs-lockfile-url vs needs-registry */
+    int cached_count = 0;
+    int need_registry_count = 0;
+    int need_download_count = 0;
+
+    /* Indices of deps that need registry fetch */
+    int need_registry[1024];
+    /* Indices of deps that can be downloaded from lockfile URL */
+    int need_download_lf[1024];
+
+    for (int i = 0; i < dep_count; i++) {
+        LockEntry *le = lockfile_find(lf, all_deps[i].name);
+        if (le) {
+            /* Check if already in node_modules */
+            char probe[2048];
+            snprintf(probe, sizeof(probe), "%s/%s/package.json",
+                     NODE_MODULES, all_deps[i].name);
+            FILE *f = fopen(probe, "r");
+            if (f) {
+                fclose(f);
+                pm_print_pkg(all_deps[i].name, le->version, 1);
+                cached_count++;
+                continue;
+            }
+            /* Have lockfile URL but not installed → download directly */
+            need_download_lf[need_download_count++] = i;
+        } else {
+            /* No lockfile entry → need registry fetch */
+            need_registry[need_registry_count++] = i;
         }
     }
 
+    int errors = 0;
+    int installed = cached_count;
+
+    /* Phase 3: parallel registry fetch for unlocked packages */
+    /* Stores resolved tarball URLs and versions for both paths */
+    char resolved_versions[1024][128];
+    char resolved_urls[1024][2048];
+    char resolved_integrity[1024][256];
+    memset(resolved_versions, 0, sizeof(resolved_versions));
+    memset(resolved_urls, 0, sizeof(resolved_urls));
+    memset(resolved_integrity, 0, sizeof(resolved_integrity));
+
+    /* Copy lockfile info for packages that just need download */
+    for (int j = 0; j < need_download_count; j++) {
+        int i = need_download_lf[j];
+        LockEntry *le = lockfile_find(lf, all_deps[i].name);
+        if (le) {
+            strncpy(resolved_versions[i], le->version, 127);
+            strncpy(resolved_urls[i], le->tarball_url, 2047);
+            strncpy(resolved_integrity[i], le->integrity, 255);
+        }
+    }
+
+    if (need_registry_count > 0) {
+        const char *fetch_names[1024];
+        PkgInfo *fetch_results[1024];
+        for (int j = 0; j < need_registry_count; j++)
+            fetch_names[j] = all_deps[need_registry[j]].name;
+
+        registry_fetch_multi(fetch_names, need_registry_count,
+                             fetch_results, INSTALL_MAX_PARALLEL);
+
+        for (int j = 0; j < need_registry_count; j++) {
+            int i = need_registry[j];
+            PkgInfo *info = fetch_results[j];
+            if (!info) {
+                fprintf(stderr, "\n  error  Cannot fetch '%s' from registry\n",
+                        all_deps[i].name);
+                errors++;
+                continue;
+            }
+
+            int idx = registry_resolve_version(info, all_deps[i].range);
+            if (idx < 0) {
+                fprintf(stderr, "\n  error  No version of '%s' satisfies '%s'\n",
+                        all_deps[i].name, all_deps[i].range);
+                registry_pkg_free(info);
+                errors++;
+                continue;
+            }
+
+            PkgVersion *pv = &info->versions[idx];
+            strncpy(resolved_versions[i], pv->version, 127);
+            strncpy(resolved_urls[i], pv->tarball_url, 2047);
+            strncpy(resolved_integrity[i], pv->integrity, 255);
+            registry_pkg_free(info);
+        }
+    }
+
+    /* Phase 4: parallel download + extract */
+    int total_to_download = need_download_count + need_registry_count;
+    if (total_to_download > 0) {
+        InstallTask *tasks = (InstallTask *)calloc((size_t)total_to_download,
+                                                    sizeof(InstallTask));
+        int *task_dep_idx = (int *)calloc((size_t)total_to_download, sizeof(int));
+        int task_count = 0;
+
+        /* Add lockfile-url downloads */
+        for (int j = 0; j < need_download_count; j++) {
+            int i = need_download_lf[j];
+            if (resolved_urls[i][0] == '\0') continue;
+            tasks[task_count].pkg_name    = all_deps[i].name;
+            tasks[task_count].version     = resolved_versions[i];
+            tasks[task_count].tarball_url = resolved_urls[i];
+            tasks[task_count].dest_dir    = NODE_MODULES;
+            tasks[task_count].result      = -1;
+            task_dep_idx[task_count]       = i;
+            task_count++;
+        }
+
+        /* Add registry-resolved downloads */
+        for (int j = 0; j < need_registry_count; j++) {
+            int i = need_registry[j];
+            if (resolved_urls[i][0] == '\0') continue;
+            tasks[task_count].pkg_name    = all_deps[i].name;
+            tasks[task_count].version     = resolved_versions[i];
+            tasks[task_count].tarball_url = resolved_urls[i];
+            tasks[task_count].dest_dir    = NODE_MODULES;
+            tasks[task_count].result      = -1;
+            task_dep_idx[task_count]       = i;
+            task_count++;
+        }
+
+        if (task_count > 0) {
+            installer_download_multi(tasks, task_count, INSTALL_MAX_PARALLEL);
+
+            for (int t = 0; t < task_count; t++) {
+                int i = task_dep_idx[t];
+                if (tasks[t].result == 0) {
+                    pm_print_pkg(all_deps[i].name, resolved_versions[i], 0);
+                    lockfile_upsert(lf, all_deps[i].name,
+                                    resolved_versions[i],
+                                    resolved_urls[i],
+                                    resolved_integrity[i]);
+                    installed++;
+                } else {
+                    fprintf(stderr, "\n  error  Failed to install '%s'\n",
+                            all_deps[i].name);
+                    errors++;
+                }
+            }
+        }
+
+        free(tasks);
+        free(task_dep_idx);
+    }
+
+    /* Phase 5: save lockfile */
     lockfile_save(lf);
     lockfile_free(lf);
     cJSON_Delete(root);
@@ -262,11 +433,11 @@ int pm_install(void) {
     printf("\n");
 
     if (errors == 0) {
-        printf("  %d package%s installed  [", total, total == 1 ? "" : "s");
+        printf("  %d package%s installed  [", installed, installed == 1 ? "" : "s");
         pm_print_elapsed(elapsed);
         printf("]\n\n");
     } else {
-        printf("  %d installed, %d failed  [", total, errors);
+        printf("  %d installed, %d failed  [", installed, errors);
         pm_print_elapsed(elapsed);
         printf("]\n\n");
     }

@@ -21,6 +21,12 @@ typedef struct PkgInfo {
  * Returns allocated PkgInfo or NULL on error. Caller must call registry_pkg_free(). */
 PkgInfo *registry_fetch(const char *name);
 
+/* Fetch metadata for multiple packages in parallel using curl_multi.
+ * results[i] is set to PkgInfo* or NULL on failure.
+ * Returns number of successful fetches. */
+int registry_fetch_multi(const char **names, int count,
+                         PkgInfo **results, int max_parallel);
+
 /* Find best matching version for a semver range string.
  * Returns index into info->versions, or -1 if not found. */
 int registry_resolve_version(PkgInfo *info, const char *range);

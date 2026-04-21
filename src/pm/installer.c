@@ -1,6 +1,7 @@
 /*
  * cinder — package installer
  * Downloads .tgz tarballs from npm and extracts them to node_modules/
+ * Supports parallel bulk downloads via curl_multi.
  */
 #include "installer.h"
 
@@ -22,6 +23,31 @@
 #  include <unistd.h>
 #  define mkdir_fn(p) mkdir(p, 0755)
 #endif
+
+/* ── Cache directory ─────────────────────────────────────────────────────────── */
+
+static char g_cache_dir[4096];
+static int  g_cache_ready = 0;
+
+void installer_cache_init(void) {
+    if (g_cache_ready) return;
+    const char *home = getenv("HOME");
+    if (!home) home = getenv("USERPROFILE");
+    if (!home) home = ".";
+    snprintf(g_cache_dir, sizeof(g_cache_dir), "%s/.cinder/cache", home);
+    g_cache_ready = 1;
+}
+
+static void cache_path_for(const char *name, const char *version,
+                           char *out, size_t out_size) {
+    installer_cache_init();
+    snprintf(out, out_size, "%s/%s-%s.tgz", g_cache_dir, name, version);
+    /* Replace / in scoped package names with -- */
+    char *start = out + strlen(g_cache_dir) + 1;
+    for (char *p = start; *p; p++) {
+        if (*p == '/') *p = '-';
+    }
+}
 
 /* ── Dynamic buffer ──────────────────────────────────────────────────────────── */
 
@@ -214,12 +240,79 @@ static int gunzip(const unsigned char *in, size_t in_len,
     return 0;
 }
 
-/* ── installer_download_and_extract ──────────────────────────────────────────── */
+/* ── Decompress + extract a .tgz buffer ──────────────────────────────────────── */
+
+static int decompress_and_extract(const unsigned char *tgz_data, size_t tgz_len,
+                                  const char *dest_dir, const char *pkg_name) {
+    unsigned char *tar_data = NULL;
+    size_t tar_len = 0;
+
+    if (gunzip(tgz_data, tgz_len, &tar_data, &tar_len) != 0)
+        return -1;
+
+    mkdirp(dest_dir);
+    int ret = extract_tar(tar_data, tar_len, dest_dir, pkg_name);
+    free(tar_data);
+    return ret;
+}
+
+/* ── Cache helpers ───────────────────────────────────────────────────────────── */
+
+static int cache_load(const char *name, const char *version,
+                      unsigned char **out, size_t *out_len) {
+    char path[4096];
+    cache_path_for(name, version, path, sizeof(path));
+
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0) { fclose(f); return -1; }
+
+    unsigned char *buf = (unsigned char *)malloc((size_t)sz);
+    if (!buf) { fclose(f); return -1; }
+    if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
+        free(buf); fclose(f); return -1;
+    }
+    fclose(f);
+
+    *out = buf;
+    *out_len = (size_t)sz;
+    return 0;
+}
+
+static void cache_store(const char *name, const char *version,
+                        const unsigned char *data, size_t len) {
+    installer_cache_init();
+    mkdirp(g_cache_dir);
+
+    char path[4096];
+    cache_path_for(name, version, path, sizeof(path));
+
+    FILE *f = fopen(path, "wb");
+    if (f) {
+        fwrite(data, 1, len, f);
+        fclose(f);
+    }
+}
+
+/* ── installer_download_and_extract (single, original API) ───────────────────── */
 
 int installer_download_and_extract(const char *pkg_name,
                                    const char *version,
                                    const char *tarball_url,
                                    const char *dest_dir) {
+    /* Try cache first */
+    unsigned char *cached = NULL;
+    size_t cached_len = 0;
+    if (cache_load(pkg_name, version, &cached, &cached_len) == 0) {
+        int ret = decompress_and_extract(cached, cached_len, dest_dir, pkg_name);
+        free(cached);
+        return ret;
+    }
+
     /* ── Download ─── */
     CURL *curl = curl_easy_init();
     if (!curl) return -1;
@@ -243,23 +336,149 @@ int installer_download_and_extract(const char *pkg_name,
         return -1;
     }
 
-    /* ── Decompress .tgz → tar ─── */
-    unsigned char *tar_data = NULL;
-    size_t tar_len = 0;
+    /* Save to cache */
+    cache_store(pkg_name, version, raw.data, raw.len);
 
-    if (gunzip(raw.data, raw.len, &tar_data, &tar_len) != 0) {
-        fprintf(stderr, "cinder: failed to decompress package %s\n", pkg_name);
-        free(raw.data);
-        return -1;
-    }
+    int ret = decompress_and_extract(raw.data, raw.len, dest_dir, pkg_name);
     free(raw.data);
-
-    /* ── Ensure dest_dir exists ─── */
-    mkdirp(dest_dir);
-
-    /* ── Extract tar ─── */
-    int ret = extract_tar(tar_data, tar_len, dest_dir, pkg_name);
-    free(tar_data);
-
     return ret;
+}
+
+/* ── Parallel bulk installer (curl_multi) ────────────────────────────────────── */
+
+typedef struct {
+    InstallTask *task;
+    ByteBuf      buf;
+    int          from_cache;
+} MultiCtx;
+
+int installer_download_multi(InstallTask *tasks, int count, int max_parallel) {
+    if (count == 0) return 0;
+    if (max_parallel <= 0) max_parallel = INSTALL_MAX_PARALLEL;
+
+    installer_cache_init();
+
+    /* First pass: serve from cache (no network needed) */
+    int ok_count = 0;
+    int need_download = 0;
+    int *need_dl = (int *)calloc((size_t)count, sizeof(int));
+    if (!need_dl) return 0;
+
+    for (int i = 0; i < count; i++) {
+        unsigned char *cached = NULL;
+        size_t cached_len = 0;
+        if (cache_load(tasks[i].pkg_name, tasks[i].version,
+                       &cached, &cached_len) == 0) {
+            if (decompress_and_extract(cached, cached_len,
+                                       tasks[i].dest_dir,
+                                       tasks[i].pkg_name) == 0) {
+                tasks[i].result = 0;
+                ok_count++;
+            } else {
+                tasks[i].result = -1;
+                need_dl[i] = 1;
+                need_download++;
+            }
+            free(cached);
+        } else {
+            need_dl[i] = 1;
+            need_download++;
+        }
+    }
+
+    if (need_download == 0) {
+        free(need_dl);
+        return ok_count;
+    }
+
+    /* Second pass: parallel download via curl_multi */
+    CURLM *multi = curl_multi_init();
+    if (!multi) { free(need_dl); return ok_count; }
+
+    curl_multi_setopt(multi, CURLMOPT_MAX_TOTAL_CONNECTIONS, (long)max_parallel);
+    curl_multi_setopt(multi, CURLMOPT_PIPELINING, CURLPIPE_MULTIPLEX);
+
+    MultiCtx *ctxs = (MultiCtx *)calloc((size_t)count, sizeof(MultiCtx));
+    if (!ctxs) { curl_multi_cleanup(multi); free(need_dl); return ok_count; }
+
+    int active_count = 0;
+    for (int i = 0; i < count; i++) {
+        if (!need_dl[i]) continue;
+
+        CURL *easy = curl_easy_init();
+        if (!easy) { tasks[i].result = -1; continue; }
+
+        ctxs[i].task = &tasks[i];
+        ctxs[i].buf  = (ByteBuf){0};
+        ctxs[i].from_cache = 0;
+
+        curl_easy_setopt(easy, CURLOPT_URL, tasks[i].tarball_url);
+        curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, curl_write_bytes);
+        curl_easy_setopt(easy, CURLOPT_WRITEDATA, &ctxs[i].buf);
+        curl_easy_setopt(easy, CURLOPT_USERAGENT, "cinder/0.1.0");
+        curl_easy_setopt(easy, CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(easy, CURLOPT_TIMEOUT, 60L);
+        curl_easy_setopt(easy, CURLOPT_PRIVATE, &ctxs[i]);
+        /* Enable connection reuse and HTTP/2 */
+        curl_easy_setopt(easy, CURLOPT_TCP_KEEPALIVE, 1L);
+        curl_easy_setopt(easy, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
+        cinder_curl_ssl_setup(easy);
+
+        curl_multi_add_handle(multi, easy);
+        active_count++;
+    }
+
+    /* Event loop: process transfers and extract as they complete */
+    int still_running = 0;
+    do {
+        CURLMcode mc = curl_multi_perform(multi, &still_running);
+        if (mc != CURLM_OK) break;
+
+        /* Process completed transfers */
+        CURLMsg *msg;
+        int msgs_left;
+        while ((msg = curl_multi_info_read(multi, &msgs_left))) {
+            if (msg->msg != CURLMSG_DONE) continue;
+
+            CURL *easy = msg->easy_handle;
+            MultiCtx *ctx = NULL;
+            curl_easy_getinfo(easy, CURLINFO_PRIVATE, &ctx);
+
+            if (msg->data.result == CURLE_OK && ctx) {
+                /* Cache the downloaded tarball */
+                cache_store(ctx->task->pkg_name, ctx->task->version,
+                            ctx->buf.data, ctx->buf.len);
+
+                if (decompress_and_extract(ctx->buf.data, ctx->buf.len,
+                                           ctx->task->dest_dir,
+                                           ctx->task->pkg_name) == 0) {
+                    ctx->task->result = 0;
+                    ok_count++;
+                } else {
+                    ctx->task->result = -1;
+                    fprintf(stderr, "  error  Failed to extract '%s'\n",
+                            ctx->task->pkg_name);
+                }
+            } else {
+                if (ctx) {
+                    ctx->task->result = -1;
+                    fprintf(stderr, "  error  Download failed for '%s'\n",
+                            ctx->task->pkg_name);
+                }
+            }
+
+            if (ctx) free(ctx->buf.data);
+            curl_multi_remove_handle(multi, easy);
+            curl_easy_cleanup(easy);
+        }
+
+        if (still_running)
+            curl_multi_wait(multi, NULL, 0, 200, NULL);
+
+    } while (still_running);
+
+    free(ctxs);
+    free(need_dl);
+    curl_multi_cleanup(multi);
+    return ok_count;
 }
