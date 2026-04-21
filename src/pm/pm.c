@@ -219,6 +219,66 @@ int pm_init(void) {
     return 0;
 }
 
+/* ── Platform package filter ──────────────────────────────────────────────────  */
+
+static char g_plat_id[64]; /* platform identifier e.g. "win32-x64", filled in pm_install */
+
+/* Returns 1 if `word` appears as a dash-delimited token in `name`. */
+static int plat_word_in_name(const char *name, const char *word) {
+    size_t wlen = strlen(word);
+    const char *p = name;
+    while ((p = strstr(p, word)) != NULL) {
+        int pre_ok = (p == name) || (*(p - 1) == '-') || (*(p - 1) == '/');
+        int post_ok = (*(p + wlen) == '\0') || (*(p + wlen) == '-');
+        if (pre_ok && post_ok) return 1;
+        p++;
+    }
+    return 0;
+}
+
+/* Returns 1 if the package should be SKIPPED for the current platform.
+ * Handles both scoped (@vendor/os-cpu) and non-scoped (pkg-os-cpu) forms. */
+static int plat_pkg_skip(const char *pkg_name) {
+    static const char *plat_oses[]  = { "darwin", "linux", "freebsd", "android", "win32", NULL };
+    static const char *plat_cpus[]  = { "arm64", "arm", "ia32", "x86", NULL }; /* NOT x64 — too common substring */
+
+    /* Extract OS and CPU from g_plat_id (e.g. "win32-x64") */
+    char cur_os[32] = {0}, cur_cpu[32] = {0};
+    const char *dash = strchr(g_plat_id, '-');
+    if (dash) {
+        size_t olen = (size_t)(dash - g_plat_id);
+        strncpy(cur_os, g_plat_id, olen < 31 ? olen : 31);
+        strncpy(cur_cpu, dash + 1, 31);
+    }
+
+    /* For scoped packages: @vendor/os-cpu or @vendor/os-cpu-abi */
+    const char *slash = strchr(pkg_name + (pkg_name[0] == '@' ? 1 : 0), '/');
+    if (slash) {
+        const char *suf = slash + 1;
+        /* Only filter if suffix looks like a platform string (has dash, no dot) */
+        if (strchr(suf, '-') && !strchr(suf, '.')) {
+            /* Allow if suffix starts with current platform id */
+            if (strncmp(suf, g_plat_id, strlen(g_plat_id)) != 0)
+                return 1; /* platform mismatch */
+        }
+        return 0;
+    }
+
+    /* For non-scoped packages: check for foreign OS identifier as a word */
+    for (int k = 0; plat_oses[k]; k++) {
+        if (strcmp(plat_oses[k], cur_os) == 0) continue; /* current OS — always OK */
+        if (plat_word_in_name(pkg_name, plat_oses[k])) return 1;
+    }
+
+    /* Check for foreign CPU architecture */
+    for (int k = 0; plat_cpus[k]; k++) {
+        if (strcmp(plat_cpus[k], cur_cpu) == 0) continue;
+        if (plat_word_in_name(pkg_name, plat_cpus[k])) return 1;
+    }
+
+    return 0;
+}
+
 /* ── Dependency collection helper ─────────────────────────────────────────────  */
 
 typedef struct {
@@ -256,17 +316,44 @@ int pm_install(void) {
 
     printf("\n");
 
-#define MAX_DEPS 1024
+    /* Platform identifier for optional dep filtering — used in Phase 1 and Phase 5 */
+#ifdef _WIN32
+    {
+        SYSTEM_INFO _si = {0};
+        GetNativeSystemInfo(&_si);
+        snprintf(g_plat_id, sizeof(g_plat_id), "win32-%s",
+                 (_si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_ARM64)
+                 ? "arm64" : "x64");
+    }
+#elif defined(__APPLE__)
+#  if defined(__aarch64__)
+    snprintf(g_plat_id, sizeof(g_plat_id), "darwin-arm64");
+#  else
+    snprintf(g_plat_id, sizeof(g_plat_id), "darwin-x64");
+#  endif
+#else
+#  if defined(__aarch64__)
+    snprintf(g_plat_id, sizeof(g_plat_id), "linux-arm64");
+#  elif defined(__arm__)
+    snprintf(g_plat_id, sizeof(g_plat_id), "linux-arm");
+#  else
+    snprintf(g_plat_id, sizeof(g_plat_id), "linux-x64");
+#  endif
+#endif
 
-    /* Phase 1: collect all dependencies — heap allocated to avoid stack overflow */
-    DepEntry *all_deps        = (DepEntry *)calloc(MAX_DEPS, sizeof(DepEntry));
-    int      *need_registry   = (int *)calloc(MAX_DEPS, sizeof(int));
-    int      *need_download_lf= (int *)calloc(MAX_DEPS, sizeof(int));
+/* all_deps tracks every package seen (root + transitive) to detect duplicates.
+ * resolved_* arrays are only for the initial root deps (Phase 2-4). */
+#define MAX_ALL_DEPS  4096
+#define MAX_ROOT_DEPS 1024
 
-    /* Resolved metadata buffers — 2MB+ total, must be on heap */
-    char (*resolved_versions)[128]  = (char(*)[128])calloc(MAX_DEPS, 128);
-    char (*resolved_urls)[2048]     = (char(*)[2048])calloc(MAX_DEPS, 2048);
-    char (*resolved_integrity)[256] = (char(*)[256])calloc(MAX_DEPS, 256);
+    DepEntry *all_deps        = (DepEntry *)calloc(MAX_ALL_DEPS, sizeof(DepEntry));
+    int      *need_registry   = (int *)calloc(MAX_ROOT_DEPS, sizeof(int));
+    int      *need_download_lf= (int *)calloc(MAX_ROOT_DEPS, sizeof(int));
+
+    /* Resolved metadata buffers for initial root deps */
+    char (*resolved_versions)[128]  = (char(*)[128])calloc(MAX_ROOT_DEPS, 128);
+    char (*resolved_urls)[2048]     = (char(*)[2048])calloc(MAX_ROOT_DEPS, 2048);
+    char (*resolved_integrity)[256] = (char(*)[256])calloc(MAX_ROOT_DEPS, 256);
 
     if (!all_deps || !need_registry || !need_download_lf ||
         !resolved_versions || !resolved_urls || !resolved_integrity) {
@@ -279,10 +366,32 @@ int pm_install(void) {
 
     int dep_count = 0;
     cJSON *deps = cJSON_GetObjectItemCaseSensitive(root, "dependencies");
-    dep_count += collect_deps(deps, all_deps + dep_count, MAX_DEPS - dep_count);
+    dep_count += collect_deps(deps, all_deps + dep_count, MAX_ROOT_DEPS - dep_count);
 
     cJSON *dev = cJSON_GetObjectItemCaseSensitive(root, "devDependencies");
-    dep_count += collect_deps(dev, all_deps + dep_count, MAX_DEPS - dep_count);
+    dep_count += collect_deps(dev, all_deps + dep_count, MAX_ROOT_DEPS - dep_count);
+
+    /* Root optional deps — platform filtered */
+    {
+        cJSON *opt = cJSON_GetObjectItemCaseSensitive(root, "optionalDependencies");
+        if (opt) {
+            cJSON *item;
+            cJSON_ArrayForEach(item, opt) {
+                if (dep_count >= MAX_ROOT_DEPS) break;
+                const char *name = item->string;
+                if (plat_pkg_skip(name)) continue;
+                strncpy(all_deps[dep_count].name, name,
+                        sizeof(all_deps[dep_count].name) - 1);
+                const char *r = cJSON_IsString(item) ? item->valuestring : "latest";
+                strncpy(all_deps[dep_count].range, r,
+                        sizeof(all_deps[dep_count].range) - 1);
+                dep_count++;
+            }
+        }
+    }
+
+    int root_dep_count = dep_count; /* Phase 2-4 only touches [0..root_dep_count) */
+    (void)root_dep_count;
 
     if (dep_count == 0) {
         printf("  No dependencies to install\n\n");
@@ -328,8 +437,8 @@ int pm_install(void) {
     }
 
     if (need_registry_count > 0) {
-        const char **fetch_names   = (const char **)calloc(MAX_DEPS, sizeof(char *));
-        PkgInfo    **fetch_results = (PkgInfo **)calloc(MAX_DEPS, sizeof(PkgInfo *));
+        const char **fetch_names   = (const char **)calloc(MAX_ROOT_DEPS, sizeof(char *));
+        PkgInfo    **fetch_results = (PkgInfo **)calloc(MAX_ROOT_DEPS, sizeof(PkgInfo *));
 
         if (fetch_names && fetch_results) {
             for (int j = 0; j < need_registry_count; j++)
@@ -424,7 +533,177 @@ int pm_install(void) {
         free(task_dep_idx);
     }
 
-    /* Phase 5: save lockfile */
+    /* Phase 5: BFS transitive + optional dependency installation.
+     *
+     * Walks every installed package's package.json, collects their
+     * `dependencies` and `optionalDependencies` (platform-filtered),
+     * installs any that are missing, then repeats until no new packages.
+     * This correctly handles deep dep trees (e.g. react-router-dom →
+     * react-router → @remix-run/router). */
+    {
+#define MAX_BATCH 512
+        int wave_cursor = 0; /* next index in all_deps to scan */
+
+        while (1) {
+            int scan_end = dep_count;
+
+            /* ── collect missing transitive deps from current wave ── */
+            DepEntry    *batch      = (DepEntry    *)calloc(MAX_BATCH, sizeof(DepEntry));
+            char       (*bver)[128] = (char(*)[128])calloc(MAX_BATCH, 128);
+            char       (*burl)[2048]= (char(*)[2048])calloc(MAX_BATCH, 2048);
+            char       (*binteg)[256]=(char(*)[256])calloc(MAX_BATCH, 256);
+            if (!batch || !bver || !burl || !binteg) {
+                free(batch); free(bver); free(burl); free(binteg); break;
+            }
+            int batch_count = 0;
+
+            for (int i = wave_cursor; i < scan_end; i++) {
+                char pj_path[2048];
+                snprintf(pj_path, sizeof(pj_path), "%s/%s/package.json",
+                         NODE_MODULES, all_deps[i].name);
+                FILE *pf = fopen(pj_path, "r");
+                if (!pf) continue;
+                fseek(pf, 0, SEEK_END); long sz = ftell(pf); fseek(pf, 0, SEEK_SET);
+                char *json = (char *)malloc((size_t)sz + 1);
+                if (!json) { fclose(pf); continue; }
+                size_t rd = fread(json, 1, (size_t)sz, pf);
+                json[rd] = '\0'; fclose(pf);
+
+                cJSON *pkg = cJSON_Parse(json);
+                free(json);
+                if (!pkg) continue;
+
+                /* Scan both `dependencies` and `optionalDependencies` */
+                const char *dep_types[] = { "dependencies", "optionalDependencies", NULL };
+                for (int dt = 0; dep_types[dt] && batch_count < MAX_BATCH; dt++) {
+                    cJSON *pkgdeps = cJSON_GetObjectItemCaseSensitive(pkg, dep_types[dt]);
+                    if (!pkgdeps) continue;
+
+                    cJSON *dep_item;
+                    cJSON_ArrayForEach(dep_item, pkgdeps) {
+                        if (batch_count >= MAX_BATCH) break;
+                        const char *dname = dep_item->string;
+
+                        /* Platform filter for optional deps */
+                        if (dt == 1 && plat_pkg_skip(dname)) continue;
+
+                        /* Skip if already tracked in all_deps (prevents cycles) */
+                        int seen = 0;
+                        for (int j = 0; j < dep_count && !seen; j++)
+                            if (strcmp(all_deps[j].name, dname) == 0) seen = 1;
+                        for (int j = 0; j < batch_count && !seen; j++)
+                            if (strcmp(batch[j].name, dname) == 0) seen = 1;
+                        if (seen) continue;
+
+                        /* Skip if already physically present in node_modules */
+                        char probe[2048];
+                        snprintf(probe, sizeof(probe), "%s/%s/package.json",
+                                 NODE_MODULES, dname);
+                        FILE *pf2 = fopen(probe, "r");
+                        if (pf2) {
+                            fclose(pf2);
+                            /* Mark as seen without installing */
+                            if (dep_count < MAX_ALL_DEPS) {
+                                strncpy(all_deps[dep_count].name, dname, 511);
+                                all_deps[dep_count].range[0] = '\0';
+                                dep_count++;
+                            }
+                            continue;
+                        }
+
+                        /* Queue for installation */
+                        strncpy(batch[batch_count].name, dname, 511);
+                        const char *vr = cJSON_IsString(dep_item)
+                                         ? dep_item->valuestring : "latest";
+                        strncpy(batch[batch_count].range, vr, 127);
+                        batch_count++;
+                    }
+                }
+                cJSON_Delete(pkg);
+            }
+
+            wave_cursor = scan_end;
+
+            if (batch_count == 0) {
+                free(batch); free(bver); free(burl); free(binteg);
+                break; /* BFS complete */
+            }
+
+            /* ── parallel registry fetch for this batch ── */
+            const char **bnames = (const char **)calloc((size_t)batch_count,
+                                                         sizeof(char *));
+            PkgInfo    **binfo  = (PkgInfo    **)calloc((size_t)batch_count,
+                                                         sizeof(PkgInfo *));
+            if (bnames && binfo) {
+                for (int j = 0; j < batch_count; j++) bnames[j] = batch[j].name;
+                registry_fetch_multi(bnames, batch_count, binfo, INSTALL_MAX_PARALLEL);
+
+                for (int j = 0; j < batch_count; j++) {
+                    /* Check lockfile first (may already be resolved) */
+                    LockEntry *le = lockfile_find(lf, batch[j].name);
+                    if (le) {
+                        strncpy(bver[j], le->version, 127);
+                        strncpy(burl[j], le->tarball_url, 2047);
+                        strncpy(binteg[j], le->integrity, 255);
+                        if (binfo[j]) { registry_pkg_free(binfo[j]); binfo[j] = NULL; }
+                        continue;
+                    }
+                    if (!binfo[j]) { burl[j][0] = '\0'; continue; }
+                    int idx = registry_resolve_version(binfo[j], batch[j].range);
+                    if (idx < 0) { burl[j][0] = '\0'; registry_pkg_free(binfo[j]); binfo[j] = NULL; continue; }
+                    PkgVersion *pv = &binfo[j]->versions[idx];
+                    strncpy(bver[j], pv->version, 127);
+                    strncpy(burl[j], pv->tarball_url, 2047);
+                    strncpy(binteg[j], pv->integrity, 255);
+                    registry_pkg_free(binfo[j]); binfo[j] = NULL;
+                }
+            }
+            free(bnames); free(binfo);
+
+            /* ── parallel install for this batch ── */
+            InstallTask *btasks    = (InstallTask *)calloc((size_t)batch_count,
+                                                            sizeof(InstallTask));
+            int         *bidx_map  = (int *)calloc((size_t)batch_count, sizeof(int));
+            int btask_count = 0;
+
+            if (btasks && bidx_map) {
+                for (int j = 0; j < batch_count; j++) {
+                    if (burl[j][0] == '\0') continue;
+                    btasks[btask_count].pkg_name    = batch[j].name;
+                    btasks[btask_count].version     = bver[j];
+                    btasks[btask_count].tarball_url = burl[j];
+                    btasks[btask_count].dest_dir    = NODE_MODULES;
+                    btasks[btask_count].result      = -1;
+                    bidx_map[btask_count]            = j;
+                    btask_count++;
+                }
+
+                if (btask_count > 0) {
+                    installer_download_multi(btasks, btask_count, INSTALL_MAX_PARALLEL);
+
+                    for (int t = 0; t < btask_count; t++) {
+                        int j = bidx_map[t];
+                        if (btasks[t].result == 0) {
+                            pm_print_pkg(batch[j].name, bver[j], 0);
+                            lockfile_upsert(lf, batch[j].name, bver[j],
+                                            burl[j], binteg[j]);
+                            installed++;
+                            if (dep_count < MAX_ALL_DEPS) {
+                                strncpy(all_deps[dep_count].name, batch[j].name, 511);
+                                strncpy(all_deps[dep_count].range, batch[j].range, 127);
+                                dep_count++;
+                            }
+                        }
+                        /* transitive failures are non-fatal */
+                    }
+                }
+            }
+            free(btasks); free(bidx_map);
+            free(batch); free(bver); free(burl); free(binteg);
+        }
+    }
+
+    /* Phase 6: save lockfile */
     lockfile_save(lf);
 
     double elapsed = pm_now_ms() - t0;

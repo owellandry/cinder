@@ -921,10 +921,15 @@ int devserver_discover(DevServerConfig *cfg, const char *root) {
         }
     }
 
-    /* Find esbuild */
+    /* Find esbuild — check native binary first, then JS wrapper */
     static const char *esbuild_candidates[] = {
+        /* Native Windows binary (installed by npm/bun as optional dep) */
+        "node_modules/@esbuild/win32-x64/esbuild.exe",
+        "node_modules/@esbuild/win32-arm64/esbuild.exe",
+        /* Shims created by npm/bun in .bin */
         "node_modules/.bin/esbuild.exe",
         "node_modules/.bin/esbuild",
+        /* JS wrapper (needs node to run — detected below) */
         "node_modules/esbuild/bin/esbuild",
         NULL
     };
@@ -982,9 +987,29 @@ int devserver_run(const DevServerConfig *cfg) {
 
     /* ── Spawn esbuild --bundle --watch (output captured via pipe) ── */
     g_use_tw_cdn = (cfg->tw_bin == NULL && cfg->css_entry != NULL);
+
+    /* Detect if esbuild bin is a JS script (shebang line) → run via node */
+    int esbuild_via_node = 0;
+    {
+        FILE *probe = fopen(cfg->esbuild_bin, "r");
+        if (probe) {
+            char head[4] = {0};
+            fread(head, 1, 3, probe);
+            fclose(probe);
+            esbuild_via_node = (head[0] == '#');  /* #!/usr/bin/env node */
+        }
+    }
+
+    /* Normalize bin path: forward slashes work on Windows but quoting is safer */
+    char esbuild_bin_norm[512];
+    snprintf(esbuild_bin_norm, sizeof(esbuild_bin_norm), "%s", cfg->esbuild_bin);
+#ifdef _WIN32
+    for (char *p = esbuild_bin_norm; *p; p++) if (*p == '/') *p = '\\';
+#endif
+
     char esbuild_cmd[2048];
     snprintf(esbuild_cmd, sizeof(esbuild_cmd),
-        "%s %s "
+        "%s%s %s "
         "--bundle "
         "--format=esm "
         "--jsx=automatic "
@@ -1003,21 +1028,34 @@ int devserver_run(const DevServerConfig *cfg) {
         "--sourcemap=inline "
         "--target=esnext "
         "--watch=forever",
-        cfg->esbuild_bin, cfg->entry, BUNDLE_FILE);
+        esbuild_via_node ? "node " : "",
+        esbuild_bin_norm, cfg->entry, BUNDLE_FILE);
 
 #ifdef _WIN32
     HANDLE esbuild_pipe = NULL;
+    g_build_start = log_now_ms(); /* track initial bundle time from spawn */
     g_esbuild_proc = spawn_background_piped(esbuild_cmd, &esbuild_pipe);
 #else
     int esbuild_pipe = -1;
+    g_build_start = log_now_ms();
     g_esbuild_proc = spawn_background_piped(esbuild_cmd, &esbuild_pipe);
 #endif
 
     /* ── Spawn tailwindcss --watch if available and CSS entry found ── */
     if (cfg->tw_bin && cfg->css_entry) {
         char tw_cmd[1024];
+        int tw_via_node = 0;
+        {
+            FILE *probe = fopen(cfg->tw_bin, "r");
+            if (probe) {
+                char head[4] = {0};
+                fread(head, 1, 3, probe);
+                fclose(probe);
+                tw_via_node = (head[0] == '#');
+            }
+        }
         const char *ext = strrchr(cfg->tw_bin, '.');
-        if (ext && strcmp(ext, ".js") == 0) {
+        if ((ext && strcmp(ext, ".js") == 0) || tw_via_node) {
             snprintf(tw_cmd, sizeof(tw_cmd),
                 "node %s --input %s --output %s --watch",
                 cfg->tw_bin, cfg->css_entry, STYLE_FILE);
