@@ -15,7 +15,7 @@ void cli_print_version(void) {
 
 void cli_print_help(void) {
     printf(
-        "cinder v" CINDER_VERSION " — JavaScript runtime & package manager\n\n"
+        "cinder v" CINDER_VERSION " - JavaScript runtime & package manager\n\n"
         "Usage:\n"
         "  cinder dev                    Start native dev server (replaces Vite)\n"
         "  cinder <file.js>              Run a JavaScript file\n"

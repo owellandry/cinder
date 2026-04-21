@@ -106,6 +106,128 @@ static pthread_mutex_t g_ws_lock = PTHREAD_MUTEX_INITIALIZER;
 #define WS_UNLOCK() pthread_mutex_unlock(&g_ws_lock)
 #endif
 
+/* ── Log / HMR state ─────────────────────────────────────────────────────────── */
+
+#define MAX_TRACKED_FILES 128
+
+typedef struct { char name[256]; int count; } TrackedFile;
+static TrackedFile g_tracked[MAX_TRACKED_FILES];
+static int         g_tracked_count = 0;
+
+#ifdef _WIN32
+static CRITICAL_SECTION g_log_lock;
+#define LOG_LOCK()   EnterCriticalSection(&g_log_lock)
+#define LOG_UNLOCK() LeaveCriticalSection(&g_log_lock)
+#else
+static pthread_mutex_t g_log_lock = PTHREAD_MUTEX_INITIALIZER;
+#define LOG_LOCK()   pthread_mutex_lock(&g_log_lock)
+#define LOG_UNLOCK() pthread_mutex_unlock(&g_log_lock)
+#endif
+
+static double log_now_ms(void) {
+#ifdef _WIN32
+    LARGE_INTEGER freq, cnt;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&cnt);
+    return (double)cnt.QuadPart * 1000.0 / (double)freq.QuadPart;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+#endif
+}
+
+/* Returns the filename portion of a path (basename) */
+static const char *path_basename(const char *path) {
+    const char *a = strrchr(path, '/');
+    const char *b = strrchr(path, '\\');
+    const char *s = (a > b) ? a : b;
+    return s ? s + 1 : path;
+}
+
+/* Increment or insert a file into the change tracker; returns new count */
+static int track_file_change(const char *name) {
+    LOG_LOCK();
+    for (int i = 0; i < g_tracked_count; i++) {
+        if (strcmp(g_tracked[i].name, name) == 0) {
+            int c = ++g_tracked[i].count;
+            LOG_UNLOCK();
+            return c;
+        }
+    }
+    if (g_tracked_count < MAX_TRACKED_FILES) {
+        strncpy(g_tracked[g_tracked_count].name, name, 255);
+        g_tracked[g_tracked_count].name[255] = '\0';
+        g_tracked[g_tracked_count].count = 1;
+        g_tracked_count++;
+    }
+    LOG_UNLOCK();
+    return 1;
+}
+
+/* ── esbuild log parser ──────────────────────────────────────────────────────── */
+
+/* Forward declaration — ws_broadcast is defined after WebSocket helpers */
+static void ws_broadcast(const char *msg);
+
+/* Per-build timing and current file (only accessed from log_reader_thread) */
+static double g_build_start = 0;
+static char   g_build_file[256] = {0};
+
+static void process_esbuild_line(const char *line) {
+    if (strstr(line, "[watch] build started")) {
+        g_build_start = log_now_ms();
+        g_build_file[0] = '\0';
+        const char *chg = strstr(line, "change: \"");
+        if (chg) {
+            chg += 9;
+            const char *end = strchr(chg, '"');
+            size_t len = end ? (size_t)(end - chg) : strlen(chg);
+            if (len >= sizeof(g_build_file)) len = sizeof(g_build_file) - 1;
+            memcpy(g_build_file, chg, len);
+            g_build_file[len] = '\0';
+            /* Use just the basename for display */
+            const char *base = path_basename(g_build_file);
+            /* Print "rebuilding file.tsx" immediately */
+            printf("  \033[33m~\033[0m  \033[36m%s\033[0m\n", base);
+            fflush(stdout);
+        }
+        return;
+    }
+
+    if (strstr(line, "[watch] build finished")) {
+        double elapsed = log_now_ms() - g_build_start;
+        if (g_build_file[0]) {
+            /* Incremental rebuild */
+            const char *base = path_basename(g_build_file);
+            int cnt = track_file_change(base);
+            /* Overwrite the "~ rebuilding" line using cursor up */
+            printf("\033[1A\033[2K");  /* cursor up + erase line */
+            if (cnt > 1)
+                printf("  \033[32m+\033[0m  \033[36m%s\033[0m  \033[2m(x%d, %.0fms)\033[0m\n",
+                       base, cnt, elapsed);
+            else
+                printf("  \033[32m+\033[0m  \033[36m%s\033[0m  \033[2m(%.0fms)\033[0m\n",
+                       base, elapsed);
+            fflush(stdout);
+            /* Trigger HMR immediately */
+            ws_broadcast("{\"type\":\"reload\"}");
+        } else {
+            /* Initial bundle */
+            printf("  \033[32m+\033[0m  \033[2mready\033[0m  \033[2m[%.0fms]\033[0m\n\n",
+                   elapsed);
+            fflush(stdout);
+        }
+        return;
+    }
+
+    /* esbuild errors/warnings */
+    if (strstr(line, " error:") || strstr(line, "ERROR")) {
+        printf("  \033[31m!\033[0m  %s\n", line);
+        fflush(stdout);
+    }
+}
+
 /* ── SHA-1 + Base64 for WebSocket handshake ─────────────────────────────────── */
 
 static void sha1_bcrypt(const unsigned char *data, size_t len,
@@ -549,107 +671,139 @@ static void *handle_connection_thread(void *arg) {
 /* ── Process spawner ─────────────────────────────────────────────────────────── */
 
 #ifdef _WIN32
-static HANDLE spawn_background(const char *cmd) {
+
+/* Spawn a process capturing stdout+stderr into a pipe.
+   *out_read = readable end of the pipe (caller must CloseHandle). */
+static HANDLE spawn_background_piped(const char *cmd, HANDLE *out_read) {
+    SECURITY_ATTRIBUTES sa = {sizeof(sa), NULL, TRUE};
+    HANDLE pipe_r, pipe_w;
+    if (!CreatePipe(&pipe_r, &pipe_w, &sa, 0)) return NULL;
+    SetHandleInformation(pipe_r, HANDLE_FLAG_INHERIT, 0); /* parent only reads */
+
     STARTUPINFOA si = {0};
     PROCESS_INFORMATION pi = {0};
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESTDHANDLES;
-    /* Give child its own null stdin so it doesn't inherit ours */
-    SECURITY_ATTRIBUTES sa = {sizeof(sa), NULL, TRUE};
-    si.hStdInput  = CreateFileA("nul", GENERIC_READ,
-                                FILE_SHARE_READ|FILE_SHARE_WRITE,
-                                &sa, OPEN_EXISTING, 0, NULL);
-    si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
-    si.hStdError  = GetStdHandle(STD_ERROR_HANDLE);
+    HANDLE null_in = CreateFileA("nul", GENERIC_READ,
+                                 FILE_SHARE_READ|FILE_SHARE_WRITE,
+                                 &sa, OPEN_EXISTING, 0, NULL);
+    si.hStdInput  = null_in;
+    si.hStdOutput = pipe_w;
+    si.hStdError  = pipe_w;
 
     char buf[4096];
     strncpy(buf, cmd, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';
 
     BOOL ok = CreateProcessA(NULL, buf, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi);
+    if (null_in != INVALID_HANDLE_VALUE) CloseHandle(null_in);
+    CloseHandle(pipe_w);
+    if (!ok) { CloseHandle(pipe_r); return NULL; }
+    CloseHandle(pi.hThread);
+    *out_read = pipe_r;
+    return pi.hProcess;
+}
+
+/* Used for tailwindcss (output goes to console) */
+static HANDLE spawn_background(const char *cmd) {
+    STARTUPINFOA si = {0};
+    PROCESS_INFORMATION pi = {0};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    SECURITY_ATTRIBUTES sa = {sizeof(sa), NULL, TRUE};
+    si.hStdInput  = CreateFileA("nul", GENERIC_READ,
+                                FILE_SHARE_READ|FILE_SHARE_WRITE,
+                                &sa, OPEN_EXISTING, 0, NULL);
+    si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    si.hStdError  = GetStdHandle(STD_ERROR_HANDLE);
+    char buf[4096];
+    strncpy(buf, cmd, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    BOOL ok = CreateProcessA(NULL, buf, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi);
     if (si.hStdInput != INVALID_HANDLE_VALUE) CloseHandle(si.hStdInput);
     if (!ok) return NULL;
     CloseHandle(pi.hThread);
     return pi.hProcess;
 }
-#else
+
+/* ── Log reader thread ───────────────────────────────────────────────────────── */
+
+static DWORD WINAPI log_reader_thread(LPVOID arg) {
+    HANDLE pipe = (HANDLE)arg;
+    char raw[4096];
+    char line[4096];
+    int  lpos = 0;
+    DWORD n;
+
+    while (ReadFile(pipe, raw, sizeof(raw) - 1, &n, NULL) && n > 0) {
+        for (DWORD i = 0; i < n; i++) {
+            char c = raw[i];
+            if (c == '\r') continue;
+            if (c == '\n') {
+                if (lpos > 0) {
+                    line[lpos] = '\0';
+                    process_esbuild_line(line);
+                    lpos = 0;
+                }
+            } else if (lpos < (int)sizeof(line) - 1) {
+                line[lpos++] = c;
+            }
+        }
+    }
+    CloseHandle(pipe);
+    return 0;
+}
+
+#else  /* ── POSIX ── */
+
+static pid_t spawn_background_piped(const char *cmd, int *out_fd) {
+    int pfd[2];
+    if (pipe(pfd) < 0) return -1;
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(pfd[0]);
+        dup2(pfd[1], STDOUT_FILENO);
+        dup2(pfd[1], STDERR_FILENO);
+        close(pfd[1]);
+        execlp("sh", "sh", "-c", cmd, NULL);
+        _exit(127);
+    }
+    close(pfd[1]);
+    *out_fd = pfd[0];
+    return pid;
+}
+
 static pid_t spawn_background(const char *cmd) {
     pid_t pid = fork();
     if (pid == 0) { execlp("sh", "sh", "-c", cmd, NULL); _exit(127); }
     return pid;
 }
-#endif
+typedef pid_t HANDLE;
 
-/* ── File watcher thread ─────────────────────────────────────────────────────── */
+static void *log_reader_thread(void *arg) {
+    int fd = *(int*)arg;
+    free(arg);
+    char raw[4096];
+    char line[4096];
+    int  lpos = 0;
+    ssize_t n;
 
-#ifdef _WIN32
-static DWORD WINAPI watcher_thread(LPVOID arg) {
-    (void)arg;
-    char cinder_path[512];
-    snprintf(cinder_path, sizeof(cinder_path), "%s\\.cinder", g_root);
-
-    HANDLE dir = CreateFileA(cinder_path,
-        FILE_LIST_DIRECTORY,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        NULL, OPEN_EXISTING,
-        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
-        NULL);
-    if (dir == INVALID_HANDLE_VALUE) return 1;
-
-    char notify_buf[4096];
-    DWORD bytes;
-    while (g_server_running) {
-        if (ReadDirectoryChangesW(dir, notify_buf, sizeof(notify_buf), FALSE,
-            FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_FILE_NAME |
-            FILE_NOTIFY_CHANGE_SIZE,
-            &bytes, NULL, NULL)) {
-            /* Debounce: wait a bit for esbuild to finish writing */
-            Sleep(80);
-            ws_broadcast("{\"type\":\"reload\"}");
-        }
-    }
-    CloseHandle(dir);
-    return 0;
-}
-#else
-static void *watcher_thread(void *arg) {
-    (void)arg;
-    int ifd = inotify_init();
-    if (ifd < 0) {
-        /* inotify unavailable: fall back to polling */
-        time_t last_bundle = 0, last_style = 0;
-        while (g_server_running) {
-            struct stat st;
-            time_t t1 = 0, t2 = 0;
-            if (stat(BUNDLE_FILE, &st) == 0) t1 = st.st_mtime;
-            if (stat(STYLE_FILE, &st) == 0) t2 = st.st_mtime;
-            if ((t1 && t1 != last_bundle) || (t2 && t2 != last_style)) {
-                last_bundle = t1; last_style = t2;
-                ws_broadcast("{\"type\":\"reload\"}");
+    while ((n = read(fd, raw, sizeof(raw) - 1)) > 0) {
+        for (ssize_t i = 0; i < n; i++) {
+            char c = raw[i];
+            if (c == '\r') continue;
+            if (c == '\n') {
+                if (lpos > 0) {
+                    line[lpos] = '\0';
+                    process_esbuild_line(line);
+                    lpos = 0;
+                }
+            } else if (lpos < (int)sizeof(line) - 1) {
+                line[lpos++] = c;
             }
-            usleep(100000);
-        }
-        return NULL;
-    }
-
-    inotify_add_watch(ifd, CINDER_DIR, IN_CLOSE_WRITE | IN_MOVED_TO);
-
-    char evt_buf[4096]
-        __attribute__((aligned(__alignof__(struct inotify_event))));
-    struct pollfd pfd = { .fd = ifd, .events = POLLIN };
-
-    while (g_server_running) {
-        int ret = poll(&pfd, 1, 200);
-        if (ret > 0 && (pfd.revents & POLLIN)) {
-            /* Drain all pending events */
-            while (read(ifd, evt_buf, sizeof(evt_buf)) > 0) {}
-            /* Short debounce for esbuild multi-write */
-            usleep(30000);
-            while (read(ifd, evt_buf, sizeof(evt_buf)) > 0) {}
-            ws_broadcast("{\"type\":\"reload\"}");
         }
     }
-    close(ifd);
+    close(fd);
     return NULL;
 }
 #endif
@@ -743,6 +897,7 @@ int devserver_run(const DevServerConfig *cfg) {
 
 #ifdef _WIN32
     InitializeCriticalSection(&g_ws_lock);
+    InitializeCriticalSection(&g_log_lock);
 #endif
 
     /* Setup dirs */
@@ -759,7 +914,7 @@ int devserver_run(const DevServerConfig *cfg) {
     WSAStartup(MAKEWORD(2, 2), &wsa);
 #endif
 
-    /* ── Spawn esbuild --bundle --watch ── */
+    /* ── Spawn esbuild --bundle --watch (output captured via pipe) ── */
     g_use_tw_cdn = (cfg->tw_bin == NULL && cfg->css_entry != NULL);
     char esbuild_cmd[2048];
     snprintf(esbuild_cmd, sizeof(esbuild_cmd),
@@ -784,12 +939,17 @@ int devserver_run(const DevServerConfig *cfg) {
         "--watch=forever",
         cfg->esbuild_bin, cfg->entry, BUNDLE_FILE);
 
-    g_esbuild_proc = spawn_background(esbuild_cmd);
+#ifdef _WIN32
+    HANDLE esbuild_pipe = NULL;
+    g_esbuild_proc = spawn_background_piped(esbuild_cmd, &esbuild_pipe);
+#else
+    int esbuild_pipe = -1;
+    g_esbuild_proc = spawn_background_piped(esbuild_cmd, &esbuild_pipe);
+#endif
 
     /* ── Spawn tailwindcss --watch if available and CSS entry found ── */
     if (cfg->tw_bin && cfg->css_entry) {
         char tw_cmd[1024];
-        /* Check if it's a .js file (needs node) */
         const char *ext = strrchr(cfg->tw_bin, '.');
         if (ext && strcmp(ext, ".js") == 0) {
             snprintf(tw_cmd, sizeof(tw_cmd),
@@ -803,14 +963,20 @@ int devserver_run(const DevServerConfig *cfg) {
         g_tw_proc = spawn_background(tw_cmd);
     }
 
-    /* ── Start file watcher thread ── */
+    /* ── Start log reader thread (parses esbuild output, triggers HMR) ── */
 #ifdef _WIN32
-    HANDLE wt = CreateThread(NULL, 0, watcher_thread, NULL, 0, NULL);
-    (void)wt;
+    if (esbuild_pipe) {
+        HANDLE lt = CreateThread(NULL, 0, log_reader_thread, (LPVOID)esbuild_pipe, 0, NULL);
+        if (lt) CloseHandle(lt);
+    }
 #else
-    pthread_t wt;
-    pthread_create(&wt, NULL, watcher_thread, NULL);
-    pthread_detach(wt);
+    if (esbuild_pipe >= 0) {
+        int *fdp = (int*)malloc(sizeof(int));
+        *fdp = esbuild_pipe;
+        pthread_t lt;
+        if (pthread_create(&lt, NULL, log_reader_thread, fdp) == 0)
+            pthread_detach(lt);
+    }
 #endif
 
     /* ── Start HTTP server ── */
@@ -837,12 +1003,10 @@ int devserver_run(const DevServerConfig *cfg) {
 
     /* Print startup banner */
     printf("\n");
-    printf("  \033[36mcinder dev\033[0m  \033[2mv0.1.0\033[0m\n\n");
-    printf("  \033[32m->\033[0m  Local:   \033[36mhttp://localhost:%d/\033[0m\n", cfg->port);
-    if (g_use_tw_cdn)
-        printf("  \033[33m!\033[0m   Tailwind CDN (dev only) — no @tailwindcss/cli found\n");
+    printf("  \033[36mcinder\033[0m \033[2mdev\033[0m\n\n");
+    printf("  \033[32m->\033[0m  \033[1mhttp://localhost:%d/\033[0m\n", cfg->port);
     printf("\n");
-    printf("  \033[2mBundling with esbuild...\033[0m\n\n");
+    printf("  \033[2mo  bundling...\033[0m\n");
     fflush(stdout);
 
     /* ── Accept loop ── */
